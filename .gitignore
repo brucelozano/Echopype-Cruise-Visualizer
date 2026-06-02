@@ -1,0 +1,23 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+venv/
+
+# Generated outputs and logs
+outputs/
+*.log
+
+# Generated standalone HTML exports
+ek80_chunked_echogram.html
+lander_timeline_viewer.html
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Cursor rules and docs
+.cursorrules
+docs/

@@ -1,0 +1,9 @@
+echopype>=0.7.1
+xarray
+dask
+numpy
+hvplot
+holoviews
+datashader
+bokeh
+panel
