@@ -2,7 +2,7 @@
 
 Process EK80 `.raw` files into daily MVBS echogram HTML exports for cruise or mission review.
 
-## What This Repo Does
+## Workflow
 
 - Reads EK80 `.raw` files (one day at a time in batch mode)
 - Calibrates to `Sv`
