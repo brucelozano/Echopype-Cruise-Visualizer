@@ -153,6 +153,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--transducer-facing",
+        type=str,
+        choices=["auto", "down", "up"],
+        default="auto",
+        help=(
+            "Vertical orientation mode passed through to the main script. "
+            "'auto' uses per-day metadata checks with safe fallback to down-looking."
+        ),
+    )
+    parser.add_argument(
         "--start-date",
         type=str,
         default=None,
@@ -297,6 +307,8 @@ def run_one_day(
         args.plot_sizing,
         "--html-resources",
         args.html_resources,
+        "--transducer-facing",
+        args.transducer_facing,
         "--ui-mode",
         "static",
     ]
@@ -435,6 +447,7 @@ def main() -> None:
             "chunk_size": args.chunk_size,
             "range_meter_bin": args.range_meter_bin,
             "ping_time_bin": args.ping_time_bin,
+            "transducer_facing": args.transducer_facing,
             "html_resources": args.html_resources,
             "channel": args.channel,
             "hide_na_gaps": args.hide_na_gaps,

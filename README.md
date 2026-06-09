@@ -22,9 +22,14 @@ Main scripts:
 
 - Python 3.10+
 
-```bash
+```cmd
 python -m pip install -r requirements.txt
 ```
+
+Command syntax note:
+
+- Windows Command Prompt (`cmd.exe`) line continuation uses `^`
+- PowerShell line continuation uses backtick `` ` `` (must be the final character on the line)
 
 ## Filename Requirement
 
@@ -45,10 +50,21 @@ Example:
 
 ## Core Batch Command (Default-Style)
 
-```bash
-python run_daily_lander_batch.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --output-dir "./outputs/daily" \
+Command Prompt (`cmd.exe`):
+
+```cmd
+python run_daily_lander_batch.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --output-dir ".\outputs\daily" ^
+  --skip-existing
+```
+
+PowerShell:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --output-dir ".\outputs\daily" `
   --skip-existing
 ```
 
@@ -56,14 +72,32 @@ python run_daily_lander_batch.py \
 
 This is the recommended command to generate outputs for all channels/frequencies at 1m/1s binning (fill in input/output paths):
 
-```bash
-python run_daily_lander_batch.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --range-meter-bin 1 \
-  --ping-time-bin 1s \
-  --vmin -85 \
-  --vmax -55 \
-  --output-dir "./outputs/daily_1m_1s_rerun"
+Command Prompt (`cmd.exe`):
+
+```cmd
+python run_daily_lander_batch.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --range-meter-bin 1 ^
+  --ping-time-bin 1s ^
+  --vmin -85 ^
+  --vmax -55 ^
+  --output-dir ".\outputs\daily_1m_1s_rerun" ^
+  --chunk-size 8 ^
+  --transducer-facing auto
+```
+
+PowerShell:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --range-meter-bin 1 `
+  --ping-time-bin 1s `
+  --vmin -85 `
+  --vmax -55 `
+  --output-dir ".\outputs\daily_1m_1s_rerun" `
+  --chunk-size 8 `
+  --transducer-facing auto
 ```
 
 What those flags control:
@@ -73,6 +107,8 @@ What those flags control:
 - `--vmin/--vmax` -> echogram color scale
 - `--raw-dir` -> input data location
 - `--output-dir` -> where per-day/channel HTML files are written
+- `--chunk-size` -> speed/memory lever
+- `--transducer-facing` -> forces/auto infers transducer facing direction
 
 Output filename prefix behavior:
 
@@ -82,6 +118,25 @@ Output filename prefix behavior:
 - Prefix casing from raw filenames is preserved
 - Override manually with `--output-prefix`
 
+## Transducer Metadata and Orientation
+
+Each run logs a per-day transducer metadata check to the day log file:
+
+- Samples representative files per day (first/last file in that day)
+- Logs transducer name/serial, transceiver serial, nominal frequencies, and `beam_direction_z`
+- Checks consistency across sampled files and warns when metadata changes
+
+Vertical plot orientation modes:
+
+- `--transducer-facing auto` (default) -> use metadata inference when possible; fallback to down-looking
+- `--transducer-facing down` -> force depth-style orientation (`invert_yaxis=True`)
+- `--transducer-facing up` -> force up-looking orientation (`invert_yaxis=False`)
+
+Notes:
+
+- Many datasets do not populate `beam_direction_z`; in that case auto mode logs a warning and defaults to down-looking.
+- For batch runs, pass the same option through `run_daily_lander_batch.py` using `--transducer-facing`.
+
 ## Hide Duty-Cycle Gaps (Experimental)
 
 Use `--hide-na-gaps` to collapse all-NaN ping bins in display.  
@@ -89,11 +144,23 @@ Sv/MVBS values are not interpolated or modified.
 
 Use a dedicated output folder for this mode:
 
-```bash
-python run_daily_lander_batch.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --hide-na-gaps \
-  --output-dir "./outputs/daily_hide_na" \
+Command Prompt (`cmd.exe`):
+
+```cmd
+python run_daily_lander_batch.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --hide-na-gaps ^
+  --output-dir ".\outputs\daily_hide_na" ^
+  --skip-existing
+```
+
+PowerShell:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --hide-na-gaps `
+  --output-dir ".\outputs\daily_hide_na" `
   --skip-existing
 ```
 
@@ -101,28 +168,50 @@ python run_daily_lander_batch.py \
 
 Useful for quick checks before full batch runs:
 
-```bash
-python ek80_chunked_echogram.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --start-datetime 2025-08-28 \
-  --duration-days 1 \
-  --ui-mode static \
-  --save-html "./outputs/one_day_check.html"
+Command Prompt (`cmd.exe`):
+
+```cmd
+python ek80_chunked_echogram.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --start-datetime 2025-08-28 ^
+  --duration-days 1 ^
+  --ui-mode static ^
+  --save-html ".\outputs\one_day_check.html"
+```
+
+PowerShell:
+
+```powershell
+python ek80_chunked_echogram.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --start-datetime 2025-08-28 `
+  --duration-days 1 `
+  --ui-mode static `
+  --save-html ".\outputs\one_day_check.html"
 ```
 
 ## Timeline Viewer
 
 Build viewer:
 
-```bash
-python build_lander_timeline_viewer.py \
-  --input-dir "./outputs/daily"
+Command Prompt (`cmd.exe`):
+
+```cmd
+python build_lander_timeline_viewer.py ^
+  --input-dir ".\outputs\daily"
+```
+
+PowerShell:
+
+```powershell
+python build_lander_timeline_viewer.py `
+  --input-dir ".\outputs\daily"
 ```
 
 Serve locally (recommended for browser compatibility):
 
-```bash
-python -m http.server 8000 --directory "./outputs/daily"
+```cmd
+python -m http.server 8000 --directory ".\outputs\daily"
 ```
 
 Open:

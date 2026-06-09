@@ -14,6 +14,7 @@ import inspect
 import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -94,6 +95,374 @@ def extract_datetime_from_filename(file_path: Path) -> dt.datetime | None:
         f"{match.group('date')}{match.group('time')}",
         "%Y%m%d%H%M%S",
     )
+
+
+@dataclass(frozen=True)
+class TransducerMetadataSnapshot:
+    """Transducer metadata extracted from a single raw file."""
+
+    raw_file: Path
+    date_yyyymmdd: str
+    transducer_names: tuple[str, ...]
+    transducer_serial_numbers: tuple[str, ...]
+    transceiver_serial_numbers: tuple[str, ...]
+    frequency_nominal_hz: tuple[float, ...]
+    beam_direction_z: tuple[float, ...]
+
+    def signature(self) -> tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[float, ...],
+        tuple[float, ...],
+    ]:
+        """Return signature used for consistency checks."""
+        return (
+            self.transducer_names,
+            self.transducer_serial_numbers,
+            self.transceiver_serial_numbers,
+            self.frequency_nominal_hz,
+            self.beam_direction_z,
+        )
+
+
+@dataclass(frozen=True)
+class DailyTransducerReport:
+    """Per-day transducer metadata summary for plotting checks."""
+
+    date_yyyymmdd: str
+    sampled_files: tuple[Path, ...]
+    metadata_available: bool
+    consistent: bool
+    inferred_facing: str | None
+    facing_reason: str
+    primary_snapshot: TransducerMetadataSnapshot | None
+
+
+def _extract_date_token(file_path: Path) -> str:
+    """Extract YYYYMMDD date token from filename, or 'unknown_date'."""
+    file_dt = extract_datetime_from_filename(file_path)
+    if file_dt is None:
+        return "unknown_date"
+    return file_dt.strftime("%Y%m%d")
+
+
+def _normalize_text_values(values: np.ndarray) -> tuple[str, ...]:
+    """Normalize string-like metadata arrays to sorted unique non-empty values."""
+    normalized: set[str] = set()
+    for item in np.asarray(values).ravel().tolist():
+        text = str(item).strip()
+        if not text:
+            continue
+        if text.lower() in {"nan", "none"}:
+            continue
+        normalized.add(text)
+    return tuple(sorted(normalized))
+
+
+def _normalize_float_values(values: np.ndarray, ndigits: int = 6) -> tuple[float, ...]:
+    """Normalize numeric metadata arrays to sorted unique finite floats."""
+    arr = np.asarray(values, dtype=float).ravel()
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return tuple()
+    rounded = np.round(finite, ndigits)
+    unique_values = np.unique(rounded)
+    return tuple(float(value) for value in unique_values.tolist())
+
+
+def _dataset_text_values(group_ds: xr.Dataset, var_name: str) -> tuple[str, ...]:
+    """Extract normalized text metadata values from an xarray dataset variable."""
+    if var_name not in group_ds:
+        return tuple()
+    return _normalize_text_values(group_ds[var_name].values)
+
+
+def _dataset_float_values(
+    group_ds: xr.Dataset, var_name: str, ndigits: int = 6
+) -> tuple[float, ...]:
+    """Extract normalized float metadata values from an xarray dataset variable."""
+    if var_name not in group_ds:
+        return tuple()
+    try:
+        return _normalize_float_values(group_ds[var_name].values, ndigits=ndigits)
+    except (TypeError, ValueError):
+        return tuple()
+
+
+def _probe_transducer_metadata(raw_file: Path) -> TransducerMetadataSnapshot | None:
+    """Probe transducer metadata from one EK80 raw file."""
+    date_token = _extract_date_token(raw_file)
+    try:
+        echodata = ep.open_raw(str(raw_file), sonar_model="EK80")
+    except Exception as exc:  # noqa: BLE001 - non-fatal metadata probe
+        LOGGER.warning(
+            "Transducer metadata probe failed for %s (%s: %s).",
+            raw_file.name,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+    try:
+        sonar_group = echodata["Sonar"]
+        beam_group = echodata["Sonar/Beam_group1"]
+        snapshot = TransducerMetadataSnapshot(
+            raw_file=raw_file,
+            date_yyyymmdd=date_token,
+            transducer_names=_dataset_text_values(sonar_group, "transducer_name"),
+            transducer_serial_numbers=_dataset_text_values(
+                sonar_group, "transducer_serial_number"
+            ),
+            transceiver_serial_numbers=_dataset_text_values(
+                sonar_group, "transceiver_serial_number"
+            ),
+            frequency_nominal_hz=_dataset_float_values(
+                sonar_group, "frequency_nominal", ndigits=3
+            ),
+            beam_direction_z=_dataset_float_values(beam_group, "beam_direction_z"),
+        )
+        return snapshot
+    except Exception as exc:  # noqa: BLE001 - non-fatal metadata probe
+        LOGGER.warning(
+            "Transducer metadata probe failed for %s (%s: %s).",
+            raw_file.name,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    finally:
+        del echodata
+        gc.collect()
+
+
+def _infer_facing_from_beam_direction_z(
+    beam_direction_z_values: Sequence[float],
+) -> tuple[str | None, str]:
+    """Infer transducer facing from beam_direction_z values when available."""
+    if not beam_direction_z_values:
+        return None, "beam_direction_z metadata is unavailable"
+
+    positives = [value for value in beam_direction_z_values if value > 0]
+    negatives = [value for value in beam_direction_z_values if value < 0]
+    if positives and not negatives:
+        return "down", "beam_direction_z > 0 (assumed down-looking)"
+    if negatives and not positives:
+        return "up", "beam_direction_z < 0 (assumed up-looking)"
+    return None, "beam_direction_z contains mixed/zero values"
+
+
+def _sample_daily_files_for_metadata(day_files: Sequence[Path]) -> list[Path]:
+    """Pick representative files within a day for metadata consistency checks."""
+    if not day_files:
+        return []
+    if len(day_files) == 1:
+        return [day_files[0]]
+    return [day_files[0], day_files[-1]]
+
+
+def collect_daily_transducer_reports(raw_files: Sequence[Path]) -> list[DailyTransducerReport]:
+    """Collect per-day transducer metadata reports from representative files."""
+    grouped_files: dict[str, list[Path]] = {}
+    for file_path in raw_files:
+        grouped_files.setdefault(_extract_date_token(file_path), []).append(file_path)
+
+    reports: list[DailyTransducerReport] = []
+    for date_token in sorted(grouped_files):
+        day_files = grouped_files[date_token]
+        sampled_files = tuple(_sample_daily_files_for_metadata(day_files))
+        snapshots: list[TransducerMetadataSnapshot] = []
+        for sample_file in sampled_files:
+            snapshot = _probe_transducer_metadata(sample_file)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+
+        if not snapshots:
+            reports.append(
+                DailyTransducerReport(
+                    date_yyyymmdd=date_token,
+                    sampled_files=sampled_files,
+                    metadata_available=False,
+                    consistent=False,
+                    inferred_facing=None,
+                    facing_reason="metadata probe unavailable for sampled files",
+                    primary_snapshot=None,
+                )
+            )
+            continue
+
+        base_signature = snapshots[0].signature()
+        consistent = all(item.signature() == base_signature for item in snapshots[1:])
+
+        inferred_values: set[str] = set()
+        facing_reasons: set[str] = set()
+        for snapshot in snapshots:
+            inferred_facing, reason = _infer_facing_from_beam_direction_z(
+                snapshot.beam_direction_z
+            )
+            facing_reasons.add(reason)
+            if inferred_facing is not None:
+                inferred_values.add(inferred_facing)
+
+        if len(inferred_values) == 1:
+            inferred_facing = next(iter(inferred_values))
+        else:
+            inferred_facing = None
+
+        if len(inferred_values) > 1:
+            facing_reason = "conflicting beam_direction_z sign across sampled files"
+        else:
+            facing_reason = "; ".join(sorted(facing_reasons))
+        if not consistent:
+            facing_reason = (
+                f"{facing_reason}; transducer metadata differs across sampled files"
+            )
+
+        reports.append(
+            DailyTransducerReport(
+                date_yyyymmdd=date_token,
+                sampled_files=sampled_files,
+                metadata_available=True,
+                consistent=consistent,
+                inferred_facing=inferred_facing,
+                facing_reason=facing_reason,
+                primary_snapshot=snapshots[0],
+            )
+        )
+
+    return reports
+
+
+def log_daily_transducer_reports(reports: Sequence[DailyTransducerReport]) -> None:
+    """Log per-day transducer metadata report details."""
+    if not reports:
+        LOGGER.warning("Transducer metadata report skipped: no files were selected.")
+        print("Transducer metadata check: no files selected.")
+        return
+
+    LOGGER.info("=== Daily transducer metadata check ===")
+    print("\nTransducer metadata check by day:")
+    for report in reports:
+        sampled_names = [path.name for path in report.sampled_files]
+        LOGGER.info(
+            "Date %s | sampled_files=%s | metadata_available=%s | consistent=%s",
+            report.date_yyyymmdd,
+            sampled_names,
+            report.metadata_available,
+            report.consistent,
+        )
+        print(
+            f"- Date {report.date_yyyymmdd} | sampled_files={sampled_names} | "
+            f"metadata_available={report.metadata_available} | consistent={report.consistent}"
+        )
+
+        snapshot = report.primary_snapshot
+        if snapshot is None:
+            LOGGER.warning("  No transducer metadata could be read for sampled files.")
+            print("  - Metadata: unavailable")
+        else:
+            LOGGER.info(
+                "  transducer_names=%s",
+                list(snapshot.transducer_names) or ["(missing)"],
+            )
+            LOGGER.info(
+                "  transducer_serial_numbers=%s",
+                list(snapshot.transducer_serial_numbers) or ["(missing)"],
+            )
+            LOGGER.info(
+                "  transceiver_serial_numbers=%s",
+                list(snapshot.transceiver_serial_numbers) or ["(missing)"],
+            )
+            LOGGER.info(
+                "  frequency_nominal_hz=%s",
+                list(snapshot.frequency_nominal_hz) or ["(missing)"],
+            )
+            LOGGER.info(
+                "  beam_direction_z=%s",
+                list(snapshot.beam_direction_z) or ["(missing/NaN)"],
+            )
+            print(
+                "  - transducer_names="
+                f"{list(snapshot.transducer_names) or ['(missing)']}"
+            )
+            print(
+                "  - transducer_serial_numbers="
+                f"{list(snapshot.transducer_serial_numbers) or ['(missing)']}"
+            )
+            print(
+                "  - transceiver_serial_numbers="
+                f"{list(snapshot.transceiver_serial_numbers) or ['(missing)']}"
+            )
+            print(
+                "  - frequency_nominal_hz="
+                f"{list(snapshot.frequency_nominal_hz) or ['(missing)']}"
+            )
+            print(
+                "  - beam_direction_z="
+                f"{list(snapshot.beam_direction_z) or ['(missing/NaN)']}"
+            )
+
+        if report.inferred_facing is not None:
+            LOGGER.info(
+                "  inferred_transducer_facing=%s | reason=%s",
+                report.inferred_facing,
+                report.facing_reason,
+            )
+            print(
+                "  - inferred_transducer_facing="
+                f"{report.inferred_facing} | reason={report.facing_reason}"
+            )
+        else:
+            LOGGER.warning(
+                "  inferred_transducer_facing=unknown | reason=%s",
+                report.facing_reason,
+            )
+            print(
+                "  - inferred_transducer_facing=unknown "
+                f"| reason={report.facing_reason}"
+            )
+
+        if not report.consistent:
+            LOGGER.warning(
+                "  Metadata consistency warning for %s; verify instrument setup changes.",
+                report.date_yyyymmdd,
+            )
+            print(
+                "  - WARNING: metadata differs across sampled files; "
+                "verify instrument setup changes."
+            )
+
+
+def resolve_transducer_facing(
+    requested_facing: str,
+    reports: Sequence[DailyTransducerReport],
+) -> tuple[str, str]:
+    """Resolve effective transducer facing used for plotting."""
+    if requested_facing in {"down", "up"}:
+        return requested_facing, "cli_override"
+
+    inferred = sorted(
+        {
+            report.inferred_facing
+            for report in reports
+            if report.inferred_facing in {"down", "up"}
+        }
+    )
+    if len(inferred) == 1:
+        return inferred[0], "metadata_auto"
+    if len(inferred) > 1:
+        LOGGER.warning(
+            "Conflicting inferred transducer facing values across days: %s. "
+            "Falling back to down-looking plotting.",
+            inferred,
+        )
+        return "down", "metadata_conflict_default_down"
+
+    LOGGER.warning(
+        "Unable to infer transducer facing from metadata. "
+        "Falling back to down-looking plotting."
+    )
+    return "down", "metadata_unavailable_default_down"
 
 
 def parse_datetime_input(value: str) -> dt.datetime:
@@ -1027,6 +1396,7 @@ def create_echogram_plot(
     title: str,
     plot_theme: str,
     plot_sizing: str,
+    transducer_facing: str,
 ) -> hv.core.Dimensioned:
     """Create an interactive hvPlot echogram.
 
@@ -1052,6 +1422,8 @@ def create_echogram_plot(
         Visual theme for plots ("dark" or "light").
     plot_sizing : str
         Plot sizing mode ("responsive" or "fixed").
+    transducer_facing : str
+        Effective transducer facing mode ("down" or "up").
 
     Returns
     -------
@@ -1084,7 +1456,11 @@ def create_echogram_plot(
             "Y-axis coordinate '%s' has insufficient valid values; using numeric index fallback.",
             y_coord,
         )
-    ylabel = "Depth (m)" if y_coord_safe == "echo_range" else y_coord_safe
+    down_looking = transducer_facing != "up"
+    if y_coord_safe == "echo_range":
+        ylabel = "Depth (m)" if down_looking else "Range Above Transducer (m)"
+    else:
+        ylabel = y_coord_safe
     tick_hook = None
     if x_coord_safe == PING_TIME_DISPLAY_COORD:
         epoch_ms_values = _build_collapsed_time_epoch_ms(sv_da)
@@ -1137,7 +1513,11 @@ def create_echogram_plot(
         hvplot_kwargs["y"] = fallback_y
         hvplot_kwargs["xlabel"] = "Ping Index (fallback)"
         hvplot_kwargs["ylabel"] = (
-            "Depth Index (fallback)"
+            (
+                "Depth Index (fallback)"
+                if down_looking
+                else "Range Index (fallback)"
+            )
             if y_coord_safe == "echo_range"
             else f"{y_coord_safe} Index (fallback)"
         )
@@ -1146,7 +1526,7 @@ def create_echogram_plot(
         )
         tick_hook = None
     opt_kwargs = {
-        "invert_yaxis": True,
+        "invert_yaxis": down_looking,
         "active_tools": ["wheel_zoom"],
         "fontsize": {"title": "12pt", "labels": "10pt", "xticks": "9pt", "yticks": "9pt"},
     }
@@ -1171,6 +1551,7 @@ def create_panel_layout(
     plot_sizing: str,
     hide_na_gaps: bool,
     html_resources: str,
+    transducer_facing: str,
 ):
     """Create a Panel layout for interactive echogram parameter tuning."""
     import panel as pn
@@ -1246,6 +1627,7 @@ def create_panel_layout(
             title=title,
             plot_theme=plot_theme,
             plot_sizing=plot_sizing,
+            transducer_facing=transducer_facing,
         )
         return plot_obj, selected_channel, title, plot_vmin, plot_vmax, x_axis_note
 
@@ -1278,6 +1660,7 @@ def create_panel_layout(
             f"- Colormap: `{cmap}`\n"
             f"- dB range: `{plot_vmin} to {plot_vmax}`\n"
             f"- X-axis: `{x_axis_note}`\n"
+            f"- Transducer facing: `{transducer_facing}`\n"
             "- Data source: `MVBS` (binned Sv), not raw ping-by-ping Sv."
         )
 
@@ -1459,6 +1842,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--transducer-facing",
+        type=str,
+        choices=["auto", "down", "up"],
+        default="auto",
+        help=(
+            "Vertical orientation mode for echogram rendering. "
+            "'auto' tries per-day metadata inference and falls back to down-looking."
+        ),
+    )
+    parser.add_argument(
         "--width",
         type=int,
         default=1400,
@@ -1559,6 +1952,17 @@ def main() -> None:
         end_datetime=end_dt,
     )
     LOGGER.info("Selected %d .raw files from %s", len(raw_files), args.raw_dir)
+    daily_transducer_reports = collect_daily_transducer_reports(raw_files)
+    log_daily_transducer_reports(daily_transducer_reports)
+    transducer_facing, transducer_facing_source = resolve_transducer_facing(
+        requested_facing=args.transducer_facing,
+        reports=daily_transducer_reports,
+    )
+    LOGGER.info(
+        "Plot transducer facing resolved to '%s' (source=%s).",
+        transducer_facing,
+        transducer_facing_source,
+    )
 
     mvbs_chunks: list[xr.Dataset] = []
     for chunk_index, chunk_files in enumerate(chunked(raw_files, args.chunk_size), start=1):
@@ -1608,6 +2012,10 @@ def main() -> None:
     selected_freq_label = f"{selected_freq} kHz" if selected_freq is not None else "frequency unknown"
     print(f"\nSelected channel for plot: {selected_channel} ({selected_freq_label})")
     print(f"X-axis mode: {x_axis_note}")
+    print(
+        "Transducer facing for plotting: "
+        f"{transducer_facing} ({transducer_facing_source})"
+    )
 
     plot_vmin, plot_vmax = normalize_color_limits(args.vmin, args.vmax)
     plot_title = f"EK80 MVBS Echogram | {selected_channel}"
@@ -1627,6 +2035,7 @@ def main() -> None:
         title=plot_title,
         plot_theme=args.plot_theme,
         plot_sizing=args.plot_sizing,
+        transducer_facing=transducer_facing,
     )
     bokeh_plot = hv.render(echogram, backend="bokeh")
     apply_bokeh_plot_theme(bokeh_plot, plot_theme=args.plot_theme)
@@ -1675,6 +2084,7 @@ def main() -> None:
                     title=channel_title,
                     plot_theme=args.plot_theme,
                     plot_sizing=args.plot_sizing,
+                    transducer_facing=transducer_facing,
                 )
                 channel_bokeh = hv.render(channel_plot, backend="bokeh")
                 channel_path = base_output_path.with_name(
@@ -1706,6 +2116,10 @@ def main() -> None:
     print(f"Final MVBS dataset shape: {dict(ds_mvbs.sizes)}")
     print(f"Time range: {str(ds_mvbs['ping_time'].min().values)} -> {str(ds_mvbs['ping_time'].max().values)}")
     print(f"Channel names available: {channels}")
+    print(
+        f"Transducer facing used: {transducer_facing} "
+        f"(source: {transducer_facing_source})"
+    )
     if args.ui_mode == "panel":
         import panel as pn
 
@@ -1725,6 +2139,7 @@ def main() -> None:
             plot_sizing=args.plot_sizing,
             hide_na_gaps=args.hide_na_gaps,
             html_resources=args.html_resources,
+            transducer_facing=transducer_facing,
         )
         LOGGER.info(
             "Starting Panel app (port=%s, auto_open_browser=%s)",
