@@ -74,6 +74,14 @@ What those flags control:
 - `--raw-dir` -> input data location
 - `--output-dir` -> where per-day/channel HTML files are written
 
+Output filename prefix behavior:
+
+- By default, batch exports infer prefix from raw filenames before `DYYYYMMDD-THHMMSS`
+  (for example, `DSB2_-D20250819-T150600.raw` -> prefix `DSB2`)
+- If inference fails, prefix falls back to `lander`
+- Prefix casing from raw filenames is preserved
+- Override manually with `--output-prefix`
+
 ## Hide Duty-Cycle Gaps (Experimental)
 
 Use `--hide-na-gaps` to collapse all-NaN ping bins in display.  
@@ -119,7 +127,8 @@ python -m http.server 8000 --directory "./outputs/daily"
 
 Open:
 
-- `http://localhost:8000/lander_timeline_viewer.html`
+- `http://localhost:8000/<prefix>_timeline_viewer.html` (single-prefix directory)
+- `http://localhost:8000/timeline_viewer.html` (mixed-prefix directory)
 
 ## Path Handling (Portable)
 
@@ -165,5 +174,5 @@ Guidelines:
 
 - For `--channel`, use the exact channel string printed by the script.
 - Hide-NA and normal exports should use separate output directories when `--skip-existing` is enabled.
-- `ek80_chunked_echogram.html` is a transient preview file from Bokeh `show()`; your important artifacts are `outputs/.../lander_*.html`.
-- Output filenames currently use the `lander_` prefix for compatibility, even when processing non-lander EK80 datasets.
+- `ek80_chunked_echogram.html` is a transient preview file from Bokeh `show()`; your important artifacts are `outputs/.../<prefix>_*.html`.
+- Timeline viewer discovers files named `<prefix>_YYYYMMDD.html` or `<prefix>_YYYYMMDD__<channel>.html`.

@@ -12,7 +12,7 @@ outputs/
 
 # Generated standalone HTML exports
 ek80_chunked_echogram.html
-lander_timeline_viewer.html
+*_timeline_viewer.html
 
 # OS/editor noise
 .DS_Store

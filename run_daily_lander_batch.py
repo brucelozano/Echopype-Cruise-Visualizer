@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from channel_naming import channel_slug
 
 
 DATE_PATTERN = re.compile(r"D(?P<date>\d{8})-T\d{6}", flags=re.IGNORECASE)
+DEFAULT_OUTPUT_PREFIX = "lander"
 
 
 @dataclass
@@ -55,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=_path_from_env("EK80_RAW_DIR"),
         help=(
-            "Directory containing all lander .raw files. "
+            "Directory containing all EK80 .raw files. "
             "Required unless EK80_RAW_DIR is set."
         ),
     )
@@ -70,6 +72,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parent / "outputs" / "daily",
         help="Directory for per-day HTML outputs and logs.",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        type=str,
+        default=None,
+        help=(
+            "Prefix used for exported daily HTML files. "
+            "Defaults to prefix inferred from raw filenames before DYYYYMMDD-THHMMSS "
+            "(falls back to 'lander'). Case from raw filenames is preserved."
+        ),
     )
     parser.add_argument(
         "--chunk-size",
@@ -194,6 +206,42 @@ def discover_dates(raw_dir: Path) -> list[str]:
     return sorted(discovered)
 
 
+def sanitize_output_prefix(value: str) -> str:
+    """Normalize output prefix text into a safe filename token."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_")
+    if not cleaned:
+        raise ValueError(
+            f"Invalid output prefix '{value}'. Include at least one alphanumeric character."
+        )
+    return cleaned
+
+
+def infer_output_prefix(raw_dir: Path, fallback: str = DEFAULT_OUTPUT_PREFIX) -> str:
+    """Infer output filename prefix from raw filenames."""
+    raw_files = sorted(raw_dir.glob("*.raw"))
+    candidates: list[str] = []
+    for file_path in raw_files:
+        match = DATE_PATTERN.search(file_path.stem)
+        if not match:
+            continue
+        raw_prefix = file_path.stem[: match.start()].rstrip("-_ .")
+        if not raw_prefix:
+            continue
+        cleaned = re.sub(r"[^A-Za-z0-9]+", "_", raw_prefix).strip("_")
+        if cleaned:
+            candidates.append(cleaned)
+
+    if not candidates:
+        return sanitize_output_prefix(fallback)
+
+    counts = Counter(candidates)
+    most_common_count = counts.most_common(1)[0][1]
+    for candidate in candidates:
+        if counts[candidate] == most_common_count:
+            return candidate
+    return candidates[0]
+
+
 def filter_dates(dates: list[str], start_date: str | None, end_date: str | None) -> list[str]:
     """Apply optional inclusive date bounds to discovered dates."""
     start_dt = parse_yyyymmdd(start_date) if start_date else None
@@ -217,10 +265,10 @@ def run_one_day(
 ) -> DayRunResult:
     """Run one day export and return structured result."""
     day_iso = parse_yyyymmdd(date_text).strftime("%Y-%m-%d")
-    html_base_path = args.output_dir / f"lander_{date_text}.html"
-    html_pattern = args.output_dir / f"lander_{date_text}__*.html"
+    html_base_path = args.output_dir / f"{args.output_prefix}_{date_text}.html"
+    html_pattern = args.output_dir / f"{args.output_prefix}_{date_text}__*.html"
     selected_channel_path: Path | None = None
-    log_path = logs_dir / f"lander_{date_text}.log"
+    log_path = logs_dir / f"{args.output_prefix}_{date_text}.log"
 
     command = [
         python_exe,
@@ -255,7 +303,7 @@ def run_one_day(
 
     if args.channel:
         selected_channel_path = args.output_dir / (
-            f"lander_{date_text}__{channel_slug(args.channel)}.html"
+            f"{args.output_prefix}_{date_text}__{channel_slug(args.channel)}.html"
         )
         command.extend(
             [
@@ -277,7 +325,7 @@ def run_one_day(
     if args.hide_na_gaps:
         command.append("--hide-na-gaps")
 
-    existing_exports = sorted(args.output_dir.glob(f"lander_{date_text}__*.html"))
+    existing_exports = sorted(args.output_dir.glob(f"{args.output_prefix}_{date_text}__*.html"))
     if args.skip_existing and (
         (selected_channel_path is not None and selected_channel_path.exists())
         or (selected_channel_path is None and len(existing_exports) > 0)
@@ -325,6 +373,11 @@ def main() -> None:
     if not args.script_path.exists():
         raise FileNotFoundError(f"Script path does not exist: {args.script_path}")
 
+    if args.output_prefix:
+        args.output_prefix = sanitize_output_prefix(args.output_prefix)
+    else:
+        args.output_prefix = infer_output_prefix(args.raw_dir)
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = args.output_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -335,7 +388,7 @@ def main() -> None:
             "Use a dedicated output directory for this variant."
         )
         if args.skip_existing:
-            existing_html = sorted(args.output_dir.glob("lander_*.html"))
+            existing_html = sorted(args.output_dir.glob(f"{args.output_prefix}_*.html"))
             if existing_html:
                 print(
                     "WARNING: --skip-existing found existing daily exports in this output directory. "
@@ -350,6 +403,7 @@ def main() -> None:
 
     print(f"Discovered {len(all_dates)} date(s), running {len(run_dates)} date(s).")
     print(f"Output directory: {args.output_dir}")
+    print(f"Output filename prefix: {args.output_prefix}")
 
     python_exe = sys.executable
     results: list[DayRunResult] = []
@@ -377,6 +431,7 @@ def main() -> None:
         "script_path": str(args.script_path),
         "output_dir": str(args.output_dir),
         "run_config": {
+            "output_prefix": args.output_prefix,
             "chunk_size": args.chunk_size,
             "range_meter_bin": args.range_meter_bin,
             "ping_time_bin": args.ping_time_bin,
