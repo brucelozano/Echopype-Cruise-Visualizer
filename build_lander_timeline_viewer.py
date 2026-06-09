@@ -19,7 +19,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-DAILY_PATTERN = re.compile(r"^lander_(?P<date>\d{8})(?:__(?P<channel>.+))?\.html$", re.IGNORECASE)
+DAILY_PATTERN = re.compile(
+    r"^(?P<prefix>.+)_(?P<date>\d{8})(?:__(?P<channel>.+))?\.html$",
+    re.IGNORECASE,
+)
 
 
 def _path_from_env(*var_names: str) -> Path | None:
@@ -35,6 +38,7 @@ def _path_from_env(*var_names: str) -> Path | None:
 class DailyHtml:
     """Represents one daily exported HTML file."""
 
+    prefix: str
     date_yyyymmdd: str
     channel_label: str
     file_path: Path
@@ -58,7 +62,10 @@ def parse_args() -> argparse.Namespace:
         "--output-html",
         type=Path,
         default=None,
-        help="Output viewer HTML path. Defaults to <input-dir>/lander_timeline_viewer.html.",
+        help=(
+            "Output viewer HTML path. Defaults to <input-dir>/<prefix>_timeline_viewer.html "
+            "for single-prefix directories, otherwise <input-dir>/timeline_viewer.html."
+        ),
     )
     parser.add_argument(
         "--channel-filter",
@@ -69,8 +76,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--title",
         type=str,
-        default="Lander Daily Echogram Timeline",
+        default="Daily Echogram Timeline",
         help="Viewer page title.",
+    )
+    parser.add_argument(
+        "--file-prefix",
+        type=str,
+        default=None,
+        help=(
+            "Optional filename prefix filter (case-insensitive). "
+            "For example, 'lander' or 'DSB2'."
+        ),
     )
     parser.add_argument(
         "--autoplay-ms",
@@ -90,15 +106,25 @@ def prettify_channel_label(raw: str | None) -> str:
     return text
 
 
-def discover_daily_html(input_dir: Path, channel_filter: str | None) -> list[DailyHtml]:
+def discover_daily_html(
+    input_dir: Path,
+    channel_filter: str | None,
+    file_prefix: str | None,
+) -> list[DailyHtml]:
     """Discover daily echogram HTML files and parse date/channel labels."""
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
 
+    prefix_filter_norm = file_prefix.lower() if file_prefix else None
     discovered: list[DailyHtml] = []
-    for file_path in sorted(input_dir.glob("lander_*.html")):
+    for file_path in sorted(input_dir.glob("*.html")):
         match = DAILY_PATTERN.match(file_path.name)
         if not match:
+            continue
+        prefix = match.group("prefix").strip()
+        if not prefix:
+            continue
+        if prefix_filter_norm and prefix.lower() != prefix_filter_norm:
             continue
         date_text = match.group("date")
         channel_label = prettify_channel_label(match.group("channel"))
@@ -106,6 +132,7 @@ def discover_daily_html(input_dir: Path, channel_filter: str | None) -> list[Dai
             continue
         discovered.append(
             DailyHtml(
+                prefix=prefix,
                 date_yyyymmdd=date_text,
                 channel_label=channel_label,
                 file_path=file_path,
@@ -113,19 +140,36 @@ def discover_daily_html(input_dir: Path, channel_filter: str | None) -> list[Dai
         )
 
     if not discovered:
-        channel_msg = f" with channel filter '{channel_filter}'" if channel_filter else ""
-        raise RuntimeError(f"No matching daily HTML files found in {input_dir}{channel_msg}.")
+        filters: list[str] = []
+        if file_prefix:
+            filters.append(f"prefix '{file_prefix}'")
+        if channel_filter:
+            filters.append(f"channel '{channel_filter}'")
+        filter_msg = f" with {' and '.join(filters)}" if filters else ""
+        raise RuntimeError(f"No matching daily HTML files found in {input_dir}{filter_msg}.")
     return discovered
 
 
 def group_for_frontend(entries: list[DailyHtml], base_dir: Path) -> dict[str, list[dict[str, str]]]:
     """Group entries by channel and serialize relative paths for browser use."""
     grouped: dict[str, list[dict[str, str]]] = {}
+    distinct_prefixes = {entry.prefix for entry in entries}
+    include_prefix_in_label = len(distinct_prefixes) > 1
     for entry in entries:
         rel_path = entry.file_path.relative_to(base_dir).as_posix()
         rel_url = quote(rel_path, safe="/")
-        grouped.setdefault(entry.channel_label, []).append(
-            {"date": entry.date_yyyymmdd, "path": rel_url, "file": entry.file_path.name}
+        group_label = (
+            f"{entry.prefix} | {entry.channel_label}"
+            if include_prefix_in_label
+            else entry.channel_label
+        )
+        grouped.setdefault(group_label, []).append(
+            {
+                "prefix": entry.prefix,
+                "date": entry.date_yyyymmdd,
+                "path": rel_url,
+                "file": entry.file_path.name,
+            }
         )
 
     for _, items in grouped.items():
@@ -239,7 +283,7 @@ def build_viewer_html(title: str, grouped_json: str, autoplay_ms: int) -> str:
 
       const item = items[currentIndex];
       frame.src = item.path;
-      meta.textContent = `Date: ${{item.date}} | Channel: ${{currentChannel}} | File: ${{item.file}} | ${{currentIndex + 1}} / ${{items.length}}`;
+      meta.textContent = `Date: ${{item.date}} | Prefix: ${{item.prefix}} | Channel: ${{currentChannel}} | File: ${{item.file}} | ${{currentIndex + 1}} / ${{items.length}}`;
     }}
 
     function step(delta) {{
@@ -312,8 +356,19 @@ def main() -> None:
             "Missing input directory. Pass --input-dir or set EK80_TIMELINE_INPUT_DIR."
         )
     input_dir = args.input_dir.resolve()
-    output_html = (args.output_html or (input_dir / "lander_timeline_viewer.html")).resolve()
-    entries = discover_daily_html(input_dir=input_dir, channel_filter=args.channel_filter)
+    entries = discover_daily_html(
+        input_dir=input_dir,
+        channel_filter=args.channel_filter,
+        file_prefix=args.file_prefix,
+    )
+    if args.output_html is not None:
+        output_html = args.output_html.resolve()
+    else:
+        prefixes = sorted({entry.prefix for entry in entries})
+        default_name = "timeline_viewer.html"
+        if len(prefixes) == 1:
+            default_name = f"{prefixes[0]}_timeline_viewer.html"
+        output_html = (input_dir / default_name).resolve()
     grouped = group_for_frontend(entries=entries, base_dir=output_html.parent)
     viewer_html = build_viewer_html(
         title=args.title,
@@ -323,6 +378,7 @@ def main() -> None:
     output_html.parent.mkdir(parents=True, exist_ok=True)
     output_html.write_text(viewer_html, encoding="utf-8")
     print(f"Built timeline viewer: {output_html}")
+    print(f"Detected prefixes: {sorted({entry.prefix for entry in entries})}")
     print(f"Detected channels: {list(grouped.keys())}")
 
 

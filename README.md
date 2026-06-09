@@ -22,9 +22,14 @@ Main scripts:
 
 - Python 3.10+
 
-```bash
+```cmd
 python -m pip install -r requirements.txt
 ```
+
+Command syntax note:
+
+- Windows Command Prompt (`cmd.exe`) line continuation uses `^`
+- PowerShell line continuation uses backtick `` ` `` (must be the final character on the line)
 
 ## Filename Requirement
 
@@ -45,10 +50,21 @@ Example:
 
 ## Core Batch Command (Default-Style)
 
-```bash
-python run_daily_lander_batch.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --output-dir "./outputs/daily" \
+Command Prompt (`cmd.exe`):
+
+```cmd
+python run_daily_lander_batch.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --output-dir ".\outputs\daily" ^
+  --skip-existing
+```
+
+PowerShell:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --output-dir ".\outputs\daily" `
   --skip-existing
 ```
 
@@ -56,14 +72,32 @@ python run_daily_lander_batch.py \
 
 This is the recommended command to generate outputs for all channels/frequencies at 1m/1s binning (fill in input/output paths):
 
-```bash
-python run_daily_lander_batch.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --range-meter-bin 1 \
-  --ping-time-bin 1s \
-  --vmin -85 \
-  --vmax -55 \
-  --output-dir "./outputs/daily_1m_1s_rerun"
+Command Prompt (`cmd.exe`):
+
+```cmd
+python run_daily_lander_batch.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --range-meter-bin 1 ^
+  --ping-time-bin 1s ^
+  --vmin -85 ^
+  --vmax -55 ^
+  --output-dir ".\outputs\daily_1m_1s_rerun" ^
+  --chunk-size 8 ^
+  --transducer-facing auto
+```
+
+PowerShell:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --range-meter-bin 1 `
+  --ping-time-bin 1s `
+  --vmin -85 `
+  --vmax -55 `
+  --output-dir ".\outputs\daily_1m_1s_rerun" `
+  --chunk-size 8 `
+  --transducer-facing auto
 ```
 
 What those flags control:
@@ -73,6 +107,35 @@ What those flags control:
 - `--vmin/--vmax` -> echogram color scale
 - `--raw-dir` -> input data location
 - `--output-dir` -> where per-day/channel HTML files are written
+- `--chunk-size` -> speed/memory lever
+- `--transducer-facing` -> forces/auto infers transducer facing direction
+
+Output filename prefix behavior:
+
+- By default, batch exports infer prefix from raw filenames before `DYYYYMMDD-THHMMSS`
+  (for example, `DSB2_-D20250819-T150600.raw` -> prefix `DSB2`)
+- If inference fails, prefix falls back to `lander`
+- Prefix casing from raw filenames is preserved
+- Override manually with `--output-prefix`
+
+## Transducer Metadata and Orientation
+
+Each run logs a per-day transducer metadata check to the day log file:
+
+- Samples representative files per day (first/last file in that day)
+- Logs transducer name/serial, transceiver serial, nominal frequencies, and `beam_direction_z`
+- Checks consistency across sampled files and warns when metadata changes
+
+Vertical plot orientation modes:
+
+- `--transducer-facing auto` (default) -> use metadata inference when possible; fallback to down-looking
+- `--transducer-facing down` -> force depth-style orientation (`invert_yaxis=True`)
+- `--transducer-facing up` -> force up-looking orientation (`invert_yaxis=False`)
+
+Notes:
+
+- Many datasets do not populate `beam_direction_z`; in that case auto mode logs a warning and defaults to down-looking.
+- For batch runs, pass the same option through `run_daily_lander_batch.py` using `--transducer-facing`.
 
 ## Hide Duty-Cycle Gaps (Experimental)
 
@@ -81,11 +144,23 @@ Sv/MVBS values are not interpolated or modified.
 
 Use a dedicated output folder for this mode:
 
-```bash
-python run_daily_lander_batch.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --hide-na-gaps \
-  --output-dir "./outputs/daily_hide_na" \
+Command Prompt (`cmd.exe`):
+
+```cmd
+python run_daily_lander_batch.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --hide-na-gaps ^
+  --output-dir ".\outputs\daily_hide_na" ^
+  --skip-existing
+```
+
+PowerShell:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --hide-na-gaps `
+  --output-dir ".\outputs\daily_hide_na" `
   --skip-existing
 ```
 
@@ -93,33 +168,56 @@ python run_daily_lander_batch.py \
 
 Useful for quick checks before full batch runs:
 
-```bash
-python ek80_chunked_echogram.py \
-  --raw-dir "/path/to/ek80_raw" \
-  --start-datetime 2025-08-28 \
-  --duration-days 1 \
-  --ui-mode static \
-  --save-html "./outputs/one_day_check.html"
+Command Prompt (`cmd.exe`):
+
+```cmd
+python ek80_chunked_echogram.py ^
+  --raw-dir "D:\Cruise\EK80\Raw" ^
+  --start-datetime 2025-08-28 ^
+  --duration-days 1 ^
+  --ui-mode static ^
+  --save-html ".\outputs\one_day_check.html"
+```
+
+PowerShell:
+
+```powershell
+python ek80_chunked_echogram.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --start-datetime 2025-08-28 `
+  --duration-days 1 `
+  --ui-mode static `
+  --save-html ".\outputs\one_day_check.html"
 ```
 
 ## Timeline Viewer
 
 Build viewer:
 
-```bash
-python build_lander_timeline_viewer.py \
-  --input-dir "./outputs/daily"
+Command Prompt (`cmd.exe`):
+
+```cmd
+python build_lander_timeline_viewer.py ^
+  --input-dir ".\outputs\daily"
+```
+
+PowerShell:
+
+```powershell
+python build_lander_timeline_viewer.py `
+  --input-dir ".\outputs\daily"
 ```
 
 Serve locally (recommended for browser compatibility):
 
-```bash
-python -m http.server 8000 --directory "./outputs/daily"
+```cmd
+python -m http.server 8000 --directory ".\outputs\daily"
 ```
 
 Open:
 
-- `http://localhost:8000/lander_timeline_viewer.html`
+- `http://localhost:8000/<prefix>_timeline_viewer.html` (single-prefix directory)
+- `http://localhost:8000/timeline_viewer.html` (mixed-prefix directory)
 
 ## Path Handling (Portable)
 
@@ -165,5 +263,5 @@ Guidelines:
 
 - For `--channel`, use the exact channel string printed by the script.
 - Hide-NA and normal exports should use separate output directories when `--skip-existing` is enabled.
-- `ek80_chunked_echogram.html` is a transient preview file from Bokeh `show()`; your important artifacts are `outputs/.../lander_*.html`.
-- Output filenames currently use the `lander_` prefix for compatibility, even when processing non-lander EK80 datasets.
+- `ek80_chunked_echogram.html` is a transient preview file from Bokeh `show()`; your important artifacts are `outputs/.../<prefix>_*.html`.
+- Timeline viewer discovers files named `<prefix>_YYYYMMDD.html` or `<prefix>_YYYYMMDD__<channel>.html`.
