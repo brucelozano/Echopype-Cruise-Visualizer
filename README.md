@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 Command syntax note:
 
 - Windows Command Prompt (`cmd.exe`) line continuation uses `^`
-- PowerShell line continuation uses backtick `` ` `` (must be the final character on the line)
+- PowerShell line continuation uses backtick ``` (must be the final character on the line)
 
 ## Filename Requirement
 
@@ -113,7 +113,7 @@ What those flags control:
 Output filename prefix behavior:
 
 - By default, batch exports infer prefix from raw filenames before `DYYYYMMDD-THHMMSS`
-  (for example, `DSB2_-D20250819-T150600.raw` -> prefix `DSB2`)
+(for example, `DSB2_-D20250819-T150600.raw` -> prefix `DSB2`)
 - If inference fails, prefix falls back to `lander`
 - Prefix casing from raw filenames is preserved
 - Override manually with `--output-prefix`
@@ -247,11 +247,13 @@ Both processing scripts support:
 
 `--chunk-size` is the main speed/memory lever.
 
+
 | Machine RAM | Suggested start for `--chunk-size` |
-| --- | --- |
-| 16 GB | 2 to 5 |
-| 32 GB | 8 to 12 |
-| 64 GB+ | 15 to 25 |
+| ----------- | ---------------------------------- |
+| 16 GB       | 2 to 5                             |
+| 32 GB       | 8 to 12                            |
+| 64 GB+      | 15 to 25                           |
+
 
 Guidelines:
 
@@ -265,3 +267,4 @@ Guidelines:
 - Hide-NA and normal exports should use separate output directories when `--skip-existing` is enabled.
 - `ek80_chunked_echogram.html` is a transient preview file from Bokeh `show()`; your important artifacts are `outputs/.../<prefix>_*.html`.
 - Timeline viewer discovers files named `<prefix>_YYYYMMDD.html` or `<prefix>_YYYYMMDD__<channel>.html`.
+
