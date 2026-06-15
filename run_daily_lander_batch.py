@@ -144,6 +144,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--export-plot-data",
+        type=str,
+        choices=["none", "netcdf", "csv", "both"],
+        default="netcdf",
+        help=(
+            "Plot-data sidecar export mode passed through to the main script. "
+            "'netcdf' (default) writes .mvbs.nc sidecars when HTML exports are saved."
+        ),
+    )
+    parser.add_argument(
+        "--plot-data-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional sidecar output directory passed through to the main script. "
+            "Defaults to each HTML output directory."
+        ),
+    )
+    parser.add_argument(
+        "--plot-data-csv-compression",
+        type=str,
+        choices=["none", "gzip"],
+        default="gzip",
+        help=(
+            "CSV sidecar compression mode passed through when "
+            "--export-plot-data includes csv."
+        ),
+    )
+    parser.add_argument(
         "--hide-na-gaps",
         action="store_true",
         help=(
@@ -307,11 +336,17 @@ def run_one_day(
         args.plot_sizing,
         "--html-resources",
         args.html_resources,
+        "--export-plot-data",
+        args.export_plot_data,
+        "--plot-data-csv-compression",
+        args.plot_data_csv_compression,
         "--transducer-facing",
         args.transducer_facing,
         "--ui-mode",
         "static",
     ]
+    if args.plot_data_dir is not None:
+        command.extend(["--plot-data-dir", str(args.plot_data_dir)])
 
     if args.channel:
         selected_channel_path = args.output_dir / (
@@ -449,6 +484,9 @@ def main() -> None:
             "ping_time_bin": args.ping_time_bin,
             "transducer_facing": args.transducer_facing,
             "html_resources": args.html_resources,
+            "export_plot_data": args.export_plot_data,
+            "plot_data_dir": str(args.plot_data_dir) if args.plot_data_dir else None,
+            "plot_data_csv_compression": args.plot_data_csv_compression,
             "channel": args.channel,
             "hide_na_gaps": args.hide_na_gaps,
             "skip_existing": args.skip_existing,

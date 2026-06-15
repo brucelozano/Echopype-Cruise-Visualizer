@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import gc
 import inspect
+import json
 import logging
 import os
 import re
@@ -40,6 +41,14 @@ DARK_MUTED = "#9ca3af"
 DARK_GRID = "#4b5563"
 PING_TIME_DISPLAY_COORD = "ping_time_display"
 PING_TIME_ACTUAL_COORD = "ping_time_actual"
+ANALYSIS_MODE_CHOICES = ("mean-vs-depth", "mean-vs-time", "scalar")
+ANALYSIS_MODE_LABELS = {
+    "mean-vs-depth": "Mean Sv vs Depth",
+    "mean-vs-time": "Mean Sv vs Time",
+    "scalar": "Scalar Mean Sv",
+}
+PLOT_DATA_EXPORT_CHOICES = ("none", "netcdf", "csv", "both")
+PLOT_DATA_CSV_COMPRESSION_CHOICES = ("none", "gzip")
 
 
 def _path_from_env(var_name: str) -> Path | None:
@@ -137,6 +146,57 @@ class DailyTransducerReport:
     inferred_facing: str | None
     facing_reason: str
     primary_snapshot: TransducerMetadataSnapshot | None
+
+
+@dataclass(frozen=True)
+class MVBSAnalysisResult:
+    """Container for MVBS-based mean Sv analysis outputs."""
+
+    selected_channel: str
+    y_coord: str
+    y_label: str
+    requested_time_start: str | None
+    requested_time_end: str | None
+    requested_depth_min: float | None
+    requested_depth_max: float | None
+    actual_time_start: str | None
+    actual_time_end: str | None
+    actual_depth_min: float | None
+    actual_depth_max: float | None
+    ping_time_count: int
+    depth_bin_count: int
+    total_cell_count: int
+    valid_cell_count: int
+    scalar_mean_sv_db: float | None
+    ping_time_bin: str | None
+    range_meter_bin: float | None
+    mean_sv_by_depth_db: xr.DataArray
+    mean_sv_by_time_db: xr.DataArray
+
+    def to_record(self, analysis_mode: str) -> dict[str, object]:
+        """Serialize scalar analysis metadata to a machine-readable record."""
+        return {
+            "analysis_mode": analysis_mode,
+            "analysis_mode_label": ANALYSIS_MODE_LABELS.get(analysis_mode, analysis_mode),
+            "selected_channel": self.selected_channel,
+            "y_coord": self.y_coord,
+            "y_label": self.y_label,
+            "requested_time_start": self.requested_time_start,
+            "requested_time_end": self.requested_time_end,
+            "requested_depth_min": self.requested_depth_min,
+            "requested_depth_max": self.requested_depth_max,
+            "actual_time_start": self.actual_time_start,
+            "actual_time_end": self.actual_time_end,
+            "actual_depth_min": self.actual_depth_min,
+            "actual_depth_max": self.actual_depth_max,
+            "ping_time_count": self.ping_time_count,
+            "depth_bin_count": self.depth_bin_count,
+            "total_cell_count": self.total_cell_count,
+            "valid_cell_count": self.valid_cell_count,
+            "scalar_mean_sv_db": self.scalar_mean_sv_db,
+            "ping_time_bin": self.ping_time_bin,
+            "range_meter_bin": self.range_meter_bin,
+        }
 
 
 def _extract_date_token(file_path: Path) -> str:
@@ -522,6 +582,302 @@ def resolve_time_window(
     return start_dt, end_dt
 
 
+def _datetime_to_iso_text(value: dt.datetime | np.datetime64 | None) -> str | None:
+    """Convert datetime-like input to a compact ISO8601 string."""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.replace(microsecond=0).isoformat(sep=" ")
+
+    datetime_value = np.datetime64(value, "ns")
+    if np.isnat(datetime_value):
+        return None
+    return np.datetime_as_string(datetime_value, unit="s").replace("T", " ")
+
+
+def _coerce_datetime_value(
+    value: str | dt.datetime | np.datetime64 | None,
+) -> dt.datetime | None:
+    """Normalize optional datetime-like inputs to Python datetime objects."""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, np.datetime64):
+        if np.isnat(value):
+            return None
+        text = np.datetime_as_string(np.datetime64(value, "ns"), unit="s")
+        return dt.datetime.fromisoformat(text.replace("T", " "))
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        return parse_datetime_input(text)
+    raise TypeError(f"Unsupported datetime input type: {type(value).__name__}")
+
+
+def _normalize_numeric_bounds(
+    lower: float | None, upper: float | None, label: str
+) -> tuple[float | None, float | None]:
+    """Return ascending numeric bounds and warn when user order is reversed."""
+    if lower is None or upper is None:
+        return lower, upper
+    if lower <= upper:
+        return lower, upper
+    LOGGER.warning(
+        "%s bounds were reversed (%s > %s); swapping for analysis selection.",
+        label,
+        lower,
+        upper,
+    )
+    return upper, lower
+
+
+def _coordinate_float_bounds(coord: xr.DataArray) -> tuple[float | None, float | None]:
+    """Return finite min/max values from a numeric coordinate."""
+    try:
+        values = np.asarray(coord.values, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return None, None
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return None, None
+    return float(finite.min()), float(finite.max())
+
+
+def _coordinate_time_bounds(coord: xr.DataArray) -> tuple[str | None, str | None]:
+    """Return min/max ISO timestamps from a datetime coordinate."""
+    values = np.asarray(coord.values)
+    if values.size == 0:
+        return None, None
+    try:
+        datetime_values = values.astype("datetime64[ns]").ravel()
+    except (TypeError, ValueError):
+        return None, None
+    valid = datetime_values[~np.isnat(datetime_values)]
+    if valid.size == 0:
+        return None, None
+    return _datetime_to_iso_text(valid.min()), _datetime_to_iso_text(valid.max())
+
+
+def _sv_db_to_linear(sv_da: xr.DataArray) -> xr.DataArray:
+    """Convert Sv in dB to linear units for physically consistent averaging."""
+    return np.power(10.0, sv_da / 10.0)
+
+
+def _linear_to_sv_db(linear_da: xr.DataArray) -> xr.DataArray:
+    """Convert linear backscatter values back to Sv in dB."""
+    safe_linear = linear_da.where(linear_da > 0)
+    return 10.0 * np.log10(safe_linear)
+
+
+def compute_linear_mean_sv_db(
+    sv_da: xr.DataArray,
+    dims: Sequence[str],
+) -> xr.DataArray:
+    """Compute mean Sv over dims by averaging in linear space then converting to dB."""
+    if not dims:
+        return sv_da
+    linear = _sv_db_to_linear(sv_da)
+    mean_linear = linear.mean(dim=list(dims), skipna=True)
+    return _linear_to_sv_db(mean_linear)
+
+
+def subset_mvbs_for_analysis(
+    sv_da: xr.DataArray,
+    y_coord: str,
+    time_start: dt.datetime | None,
+    time_end: dt.datetime | None,
+    depth_min: float | None,
+    depth_max: float | None,
+) -> xr.DataArray:
+    """Apply optional time/depth filters to an MVBS Sv DataArray."""
+    subset = sv_da
+
+    if (time_start is not None or time_end is not None) and "ping_time" not in subset.dims:
+        raise ValueError("Selected dataset does not expose a 'ping_time' axis for time filtering.")
+
+    if time_start is not None and time_end is not None and time_end <= time_start:
+        raise ValueError(
+            f"Invalid analysis time window: end ({time_end.isoformat()}) "
+            f"must be after start ({time_start.isoformat()})."
+        )
+    if time_start is not None or time_end is not None:
+        start_value = np.datetime64(time_start) if time_start is not None else None
+        end_value = np.datetime64(time_end) if time_end is not None else None
+        subset = subset.sel(ping_time=slice(start_value, end_value))
+
+    depth_min_norm, depth_max_norm = _normalize_numeric_bounds(depth_min, depth_max, "Depth")
+    if depth_min_norm is not None or depth_max_norm is not None:
+        if y_coord not in subset.coords and y_coord not in subset.dims:
+            raise ValueError(
+                f"Cannot apply depth bounds because coordinate '{y_coord}' is unavailable."
+            )
+        coord = subset[y_coord]
+        mask = coord.notnull()
+        if depth_min_norm is not None:
+            mask = mask & (coord >= depth_min_norm)
+        if depth_max_norm is not None:
+            mask = mask & (coord <= depth_max_norm)
+        subset = subset.where(mask, drop=True)
+
+    if subset.size == 0 or any(size == 0 for size in subset.sizes.values()):
+        raise ValueError("Selected analysis window contains no MVBS bins.")
+    return subset
+
+
+def compute_mvbs_mean_sv_analysis(
+    ds_mvbs: xr.Dataset,
+    channel_name: str | None,
+    time_start: str | dt.datetime | np.datetime64 | None = None,
+    time_end: str | dt.datetime | np.datetime64 | None = None,
+    depth_min: float | None = None,
+    depth_max: float | None = None,
+    ping_time_bin: str | None = None,
+    range_meter_bin: float | None = None,
+) -> MVBSAnalysisResult:
+    """Compute mean-Sv analysis products from an MVBS dataset."""
+    sv_da, y_coord, selected_channel = build_plot_dataarray(ds_mvbs, channel_name)
+    time_start_dt = _coerce_datetime_value(time_start)
+    time_end_dt = _coerce_datetime_value(time_end)
+    subset = subset_mvbs_for_analysis(
+        sv_da=sv_da,
+        y_coord=y_coord,
+        time_start=time_start_dt,
+        time_end=time_end_dt,
+        depth_min=depth_min,
+        depth_max=depth_max,
+    )
+
+    y_dim = _resolve_axis_dimension(subset, y_coord)
+    if y_dim is None or y_dim not in subset.dims:
+        raise ValueError(f"Unable to resolve analysis depth axis from '{y_coord}'.")
+
+    mean_sv_by_depth_db = compute_linear_mean_sv_db(
+        subset,
+        dims=("ping_time",) if "ping_time" in subset.dims else tuple(),
+    )
+    mean_sv_by_time_db = compute_linear_mean_sv_db(subset, dims=(y_dim,))
+    scalar_da = compute_linear_mean_sv_db(subset, dims=tuple(subset.dims))
+
+    scalar_mean_sv_db: float | None = None
+    scalar_values = np.asarray(scalar_da.values).ravel()
+    if scalar_values.size > 0 and np.isfinite(scalar_values[0]):
+        scalar_mean_sv_db = float(scalar_values[0])
+
+    valid_cell_count = int(subset.notnull().sum().item())
+    if valid_cell_count == 0:
+        raise ValueError("Selected analysis window has no valid Sv bins (all NaN).")
+
+    total_cell_count = int(np.prod(list(subset.sizes.values()), dtype=np.int64))
+    ping_time_count = int(subset.sizes.get("ping_time", 0))
+    depth_bin_count = int(subset.sizes.get(y_dim, 0))
+
+    actual_time_start, actual_time_end = (
+        _coordinate_time_bounds(subset["ping_time"])
+        if "ping_time" in subset.coords
+        else (None, None)
+    )
+    actual_depth_min, actual_depth_max = _coordinate_float_bounds(subset[y_coord])
+    y_label = "Depth (m)" if y_coord == "echo_range" else f"{y_coord} index"
+
+    return MVBSAnalysisResult(
+        selected_channel=selected_channel,
+        y_coord=y_coord,
+        y_label=y_label,
+        requested_time_start=_datetime_to_iso_text(time_start_dt),
+        requested_time_end=_datetime_to_iso_text(time_end_dt),
+        requested_depth_min=depth_min,
+        requested_depth_max=depth_max,
+        actual_time_start=actual_time_start,
+        actual_time_end=actual_time_end,
+        actual_depth_min=actual_depth_min,
+        actual_depth_max=actual_depth_max,
+        ping_time_count=ping_time_count,
+        depth_bin_count=depth_bin_count,
+        total_cell_count=total_cell_count,
+        valid_cell_count=valid_cell_count,
+        scalar_mean_sv_db=scalar_mean_sv_db,
+        ping_time_bin=ping_time_bin,
+        range_meter_bin=range_meter_bin,
+        mean_sv_by_depth_db=mean_sv_by_depth_db,
+        mean_sv_by_time_db=mean_sv_by_time_db,
+    )
+
+
+def format_analysis_summary_markdown(
+    result: MVBSAnalysisResult,
+    analysis_mode: str,
+) -> str:
+    """Build markdown summary text for analysis results."""
+    scalar_text = (
+        f"{result.scalar_mean_sv_db:.2f} dB"
+        if result.scalar_mean_sv_db is not None and np.isfinite(result.scalar_mean_sv_db)
+        else "N/A"
+    )
+    mode_label = ANALYSIS_MODE_LABELS.get(analysis_mode, analysis_mode)
+    return (
+        "### Analysis Summary\n"
+        f"- Mode: `{mode_label}`\n"
+        f"- Channel: `{result.selected_channel}`\n"
+        f"- Time window requested: `{result.requested_time_start or '-inf'} -> {result.requested_time_end or '+inf'}`\n"
+        f"- Time window used: `{result.actual_time_start or 'n/a'} -> {result.actual_time_end or 'n/a'}`\n"
+        f"- Depth window requested: `{result.requested_depth_min if result.requested_depth_min is not None else '-inf'} -> {result.requested_depth_max if result.requested_depth_max is not None else '+inf'}`\n"
+        f"- Depth window used: `{result.actual_depth_min if result.actual_depth_min is not None else 'n/a'} -> {result.actual_depth_max if result.actual_depth_max is not None else 'n/a'}`\n"
+        f"- Valid bins: `{result.valid_cell_count}/{result.total_cell_count}`\n"
+        f"- Scalar mean Sv: `{scalar_text}`\n"
+        f"- MVBS bins: `range={result.range_meter_bin if result.range_meter_bin is not None else 'n/a'} m, ping_time={result.ping_time_bin or 'n/a'}`"
+    )
+
+
+def append_analysis_record_jsonl(output_path: Path, record: dict[str, object]) -> Path:
+    """Append one analysis record to a JSONL artifact and return resolved path."""
+    resolved = output_path.resolve()
+    if resolved.suffix.lower() != ".jsonl":
+        resolved = resolved.with_suffix(".jsonl")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False))
+        handle.write("\n")
+    return resolved
+
+
+def analysis_summary_lines(
+    result: MVBSAnalysisResult,
+    analysis_mode: str,
+) -> list[str]:
+    """Build plain-text lines for stdout/log reporting."""
+    scalar_text = (
+        f"{result.scalar_mean_sv_db:.2f} dB"
+        if result.scalar_mean_sv_db is not None and np.isfinite(result.scalar_mean_sv_db)
+        else "N/A"
+    )
+    return [
+        f"Mode: {ANALYSIS_MODE_LABELS.get(analysis_mode, analysis_mode)}",
+        f"Channel: {result.selected_channel}",
+        (
+            "Time window (requested -> used): "
+            f"{result.requested_time_start or '-inf'} -> {result.requested_time_end or '+inf'} | "
+            f"{result.actual_time_start or 'n/a'} -> {result.actual_time_end or 'n/a'}"
+        ),
+        (
+            "Depth window (requested -> used): "
+            f"{result.requested_depth_min if result.requested_depth_min is not None else '-inf'} "
+            f"-> {result.requested_depth_max if result.requested_depth_max is not None else '+inf'} | "
+            f"{result.actual_depth_min if result.actual_depth_min is not None else 'n/a'} "
+            f"-> {result.actual_depth_max if result.actual_depth_max is not None else 'n/a'}"
+        ),
+        f"Valid bins: {result.valid_cell_count}/{result.total_cell_count}",
+        f"Scalar mean Sv: {scalar_text}",
+        (
+            "MVBS bins: "
+            f"range={result.range_meter_bin if result.range_meter_bin is not None else 'n/a'} m, "
+            f"ping_time={result.ping_time_bin or 'n/a'}"
+        ),
+    ]
+
+
 def list_raw_files(
     raw_dir: Path,
     max_files: int,
@@ -841,6 +1197,160 @@ def save_bokeh_plot_html(
     return html_path
 
 
+def _resolve_plot_data_output_dir(
+    html_path: Path,
+    plot_data_dir: Path | None,
+) -> Path:
+    """Resolve sidecar output directory for plot-data exports."""
+    if plot_data_dir is None:
+        output_dir = html_path.parent
+    else:
+        output_dir = plot_data_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _plot_data_base_path(
+    html_path: Path,
+    plot_data_dir: Path | None,
+) -> Path:
+    """Return base path stem used for plot-data sidecar files."""
+    output_dir = _resolve_plot_data_output_dir(html_path, plot_data_dir)
+    return output_dir / html_path.stem
+
+
+def _build_plot_data_dataset(
+    sv_da: xr.DataArray,
+    selected_channel: str,
+    x_coord: str,
+    y_coord: str,
+    x_axis_note: str,
+    hide_na_gaps: bool,
+    transducer_facing: str,
+    ping_time_bin: str,
+    range_meter_bin: float,
+) -> xr.Dataset:
+    """Build a metadata-rich dataset sidecar from the plotted Sv DataArray."""
+    plot_ds = sv_da.to_dataset(name="Sv")
+    plot_ds.attrs.update(
+        {
+            "selected_channel": selected_channel,
+            "x_coord": x_coord,
+            "y_coord": y_coord,
+            "x_axis_note": x_axis_note,
+            "hide_na_gaps": "true" if hide_na_gaps else "false",
+            "transducer_facing": transducer_facing,
+            "mvbs_ping_time_bin": ping_time_bin,
+            "mvbs_range_meter_bin": float(range_meter_bin),
+            "exported_at": dt.datetime.now().replace(microsecond=0).isoformat(sep=" "),
+        }
+    )
+    plot_ds["Sv"].attrs.setdefault("long_name", "Mean Volume Backscattering Strength")
+    plot_ds["Sv"].attrs.setdefault("units", "dB")
+    return plot_ds
+
+
+def _export_plot_data_netcdf(
+    plot_ds: xr.Dataset,
+    output_path: Path,
+) -> Path:
+    """Write NetCDF sidecar, preferring compression when available."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        plot_ds.to_netcdf(
+            output_path,
+            encoding={"Sv": {"zlib": True, "complevel": 4}},
+        )
+    except Exception as exc:  # noqa: BLE001 - fallback when backend lacks compression support
+        LOGGER.warning(
+            "Compressed NetCDF sidecar export failed for %s (%s). "
+            "Retrying without compression.",
+            output_path.name,
+            exc,
+        )
+        plot_ds.to_netcdf(output_path)
+    return output_path
+
+
+def _export_plot_data_csv(
+    plot_ds: xr.Dataset,
+    output_path: Path,
+    csv_compression: str,
+) -> Path:
+    """Write CSV sidecar from plotted Sv data."""
+    csv_output_path = output_path
+    if csv_compression == "gzip" and not csv_output_path.name.endswith(".gz"):
+        csv_output_path = Path(f"{csv_output_path}.gz")
+
+    dataframe = plot_ds["Sv"].to_dataframe().reset_index()
+    compression_arg = "gzip" if csv_compression == "gzip" else None
+    dataframe.to_csv(csv_output_path, index=False, compression=compression_arg)
+    return csv_output_path
+
+
+def export_plot_data_sidecars(
+    sv_da: xr.DataArray,
+    selected_channel: str,
+    x_coord: str,
+    y_coord: str,
+    x_axis_note: str,
+    hide_na_gaps: bool,
+    transducer_facing: str,
+    ping_time_bin: str,
+    range_meter_bin: float,
+    html_path: Path,
+    export_mode: str,
+    plot_data_dir: Path | None,
+    csv_compression: str,
+) -> list[Path]:
+    """Export plotted MVBS data sidecars (NetCDF/CSV) aligned with saved HTML."""
+    if export_mode == "none":
+        return []
+    if export_mode not in PLOT_DATA_EXPORT_CHOICES:
+        raise ValueError(
+            f"Unsupported export mode '{export_mode}'. "
+            f"Expected one of: {PLOT_DATA_EXPORT_CHOICES}"
+        )
+    if csv_compression not in PLOT_DATA_CSV_COMPRESSION_CHOICES:
+        raise ValueError(
+            f"Unsupported CSV compression '{csv_compression}'. "
+            f"Expected one of: {PLOT_DATA_CSV_COMPRESSION_CHOICES}"
+        )
+
+    plot_ds = _build_plot_data_dataset(
+        sv_da=sv_da,
+        selected_channel=selected_channel,
+        x_coord=x_coord,
+        y_coord=y_coord,
+        x_axis_note=x_axis_note,
+        hide_na_gaps=hide_na_gaps,
+        transducer_facing=transducer_facing,
+        ping_time_bin=ping_time_bin,
+        range_meter_bin=range_meter_bin,
+    )
+    base_path = _plot_data_base_path(html_path=html_path, plot_data_dir=plot_data_dir)
+    saved_paths: list[Path] = []
+
+    if export_mode in {"netcdf", "both"}:
+        netcdf_path = Path(f"{base_path}.mvbs.nc")
+        saved_paths.append(
+            _export_plot_data_netcdf(
+                plot_ds=plot_ds,
+                output_path=netcdf_path,
+            )
+        )
+    if export_mode in {"csv", "both"}:
+        csv_path = Path(f"{base_path}.mvbs.csv")
+        saved_paths.append(
+            _export_plot_data_csv(
+                plot_ds=plot_ds,
+                output_path=csv_path,
+                csv_compression=csv_compression,
+            )
+        )
+    return saved_paths
+
+
 def _extract_echodata_channels(echodata: ep.EchoData) -> tuple[str, ...]:
     """Extract sorted channel labels present across all groups in an EchoData object."""
     channels: set[str] = set()
@@ -1035,24 +1545,40 @@ def build_plot_dataarray(
             "Expected 'Sv' variable missing in MVBS output. "
             f"Available variables: {list(ds_mvbs.data_vars)}"
         )
-    if "channel" not in ds_mvbs.dims:
-        raise KeyError(
-            "Expected 'channel' dimension missing in MVBS output. "
-            f"Available dimensions: {dict(ds_mvbs.sizes)}"
-        )
+    if "channel" in ds_mvbs.dims:
+        channels = ds_mvbs["channel"].astype(str).values.tolist()
+        if channel_name is None:
+            channel_name = channels[0]
+            LOGGER.info("No channel selected. Using first channel: %s", channel_name)
+        elif channel_name not in channels:
+            raise ValueError(
+                "Requested channel not found.\n"
+                f"Requested: {channel_name}\n"
+                f"Available: {channels}"
+            )
 
-    channels = ds_mvbs["channel"].astype(str).values.tolist()
-    if channel_name is None:
-        channel_name = channels[0]
-        LOGGER.info("No channel selected. Using first channel: %s", channel_name)
-    elif channel_name not in channels:
-        raise ValueError(
-            "Requested channel not found.\n"
-            f"Requested: {channel_name}\n"
-            f"Available: {channels}"
-        )
+        sv_da = ds_mvbs["Sv"].sel(channel=channel_name)
+    else:
+        sv_da = ds_mvbs["Sv"]
+        inferred_channel: str | None = None
+        if "channel" in ds_mvbs.coords:
+            try:
+                inferred_channel = str(np.asarray(ds_mvbs["channel"].values).item())
+            except (TypeError, ValueError):
+                inferred_channel = None
+        if inferred_channel is None:
+            selected_attr = ds_mvbs.attrs.get("selected_channel")
+            if selected_attr:
+                inferred_channel = str(selected_attr)
 
-    sv_da = ds_mvbs["Sv"].sel(channel=channel_name)
+        if channel_name is None:
+            channel_name = inferred_channel or "unknown_channel"
+        elif inferred_channel is not None and channel_name != inferred_channel:
+            raise ValueError(
+                "Requested channel does not match this MVBS sidecar.\n"
+                f"Requested: {channel_name}\n"
+                f"Sidecar channel: {inferred_channel}"
+            )
 
     if "echo_range" in sv_da.coords:
         echo_range = sv_da["echo_range"]
@@ -1336,6 +1862,18 @@ def _build_collapsed_time_hook(
     return _hook
 
 
+def _build_dark_theme_hook():
+    """Create a Holoviews hook that applies dark Bokeh styling live."""
+
+    def _hook(plot, _element) -> None:
+        state = getattr(plot, "state", None)
+        if state is None:
+            return
+        apply_bokeh_plot_theme(state, plot_theme="dark")
+
+    return _hook
+
+
 def _sanitize_plot_axis(
     sv_da: xr.DataArray,
     axis_name: str,
@@ -1482,8 +2020,7 @@ def create_echogram_plot(
     }
     if plot_sizing == "responsive":
         hvplot_kwargs["responsive"] = True
-        hvplot_kwargs["min_width"] = width
-        hvplot_kwargs["min_height"] = height
+        hvplot_kwargs["min_height"] = max(280, min(height, 600))
     else:
         hvplot_kwargs["width"] = width
         hvplot_kwargs["height"] = height
@@ -1530,8 +2067,13 @@ def create_echogram_plot(
         "active_tools": ["wheel_zoom"],
         "fontsize": {"title": "12pt", "labels": "10pt", "xticks": "9pt", "yticks": "9pt"},
     }
+    hooks = []
     if tick_hook is not None:
-        opt_kwargs["hooks"] = [tick_hook]
+        hooks.append(tick_hook)
+    if plot_theme == "dark":
+        hooks.append(_build_dark_theme_hook())
+    if hooks:
+        opt_kwargs["hooks"] = hooks
     if plot_theme == "dark":
         opt_kwargs["bgcolor"] = DARK_BG
     return plot.opts(**opt_kwargs)
@@ -1552,9 +2094,81 @@ def create_panel_layout(
     hide_na_gaps: bool,
     html_resources: str,
     transducer_facing: str,
+    ping_time_bin: str,
+    range_meter_bin: float,
+    export_plot_data: str,
+    plot_data_dir: Path | None,
+    plot_data_csv_compression: str,
 ):
     """Create a Panel layout for interactive echogram parameter tuning."""
     import panel as pn
+
+    is_dark_theme = plot_theme == "dark"
+    dark_text = "#f3f4f6"
+    dark_surface = "#111827"
+    dark_style_vars = (
+        {
+            "--design-background-color": DARK_BG,
+            "--design-background-text-color": dark_text,
+            "--design-surface-color": dark_surface,
+            "--design-surface-text-color": dark_text,
+            "--panel-background-color": DARK_BG,
+            "--panel-on-background-color": dark_text,
+            "--panel-surface-color": dark_surface,
+            "--panel-on-surface-color": dark_text,
+            "--text-color": dark_text,
+            "background": DARK_BG,
+            "color": dark_text,
+        }
+        if is_dark_theme
+        else {}
+    )
+    dark_surface_vars = (
+        {
+            **dark_style_vars,
+            "background": dark_surface,
+            "color": dark_text,
+        }
+        if is_dark_theme
+        else {}
+    )
+    accordion_dark_stylesheet = (
+        """
+:host {
+  --design-background-color: #000000;
+  --design-background-text-color: #f3f4f6;
+  --design-surface-color: #111827;
+  --design-surface-text-color: #f3f4f6;
+  --text-color: #f3f4f6;
+  color: #f3f4f6;
+}
+.bk-header,
+.bk-accordion-header,
+.accordion-header {
+  background-color: #111827 !important;
+  color: #f3f4f6 !important;
+}
+"""
+        if is_dark_theme
+        else None
+    )
+    widget_dark_stylesheet = (
+        """
+:host {
+  --design-background-color: #111827;
+  --design-background-text-color: #f3f4f6;
+  --design-surface-color: #111827;
+  --design-surface-text-color: #f3f4f6;
+  --text-color: #f3f4f6;
+  color: #f3f4f6;
+}
+label, span, p {
+  color: #f3f4f6 !important;
+}
+"""
+        if is_dark_theme
+        else None
+    )
 
     channel_labels = [build_channel_label(channel) for channel in channels]
     label_to_channel = dict(zip(channel_labels, channels))
@@ -1585,6 +2199,25 @@ def create_panel_layout(
     )
     export_button = pn.widgets.Button(name="Export Current View to HTML", button_type="primary")
     export_status = pn.pane.Markdown("No export yet.", sizing_mode="stretch_width")
+
+    if is_dark_theme:
+        widget_surface_styles = {
+            "--text-color": dark_text,
+            "--design-background-text-color": dark_text,
+            "--design-surface-text-color": dark_text,
+            "background": dark_surface,
+            "color": dark_text,
+        }
+        for widget in (
+            channel_select,
+            cmap_select,
+            vmin_slider,
+            vmax_slider,
+            export_path_input,
+            export_button,
+        ):
+            widget.styles = widget_surface_styles
+            widget.stylesheets = [widget_dark_stylesheet]
 
     def build_plot_for_settings(
         channel_label: str,
@@ -1661,6 +2294,7 @@ def create_panel_layout(
             f"- dB range: `{plot_vmin} to {plot_vmax}`\n"
             f"- X-axis: `{x_axis_note}`\n"
             f"- Transducer facing: `{transducer_facing}`\n"
+            f"- Plot-data sidecars: `{export_plot_data}`\n"
             "- Data source: `MVBS` (binned Sv), not raw ping-by-ping Sv."
         )
 
@@ -1675,6 +2309,7 @@ def create_panel_layout(
             export_path = export_path.resolve()
             export_path.parent.mkdir(parents=True, exist_ok=True)
 
+            selected_channel = label_to_channel[channel_select.value]
             plot_obj, _, title, _, _, _ = build_plot_for_settings(
                 channel_select.value,
                 cmap_select.value,
@@ -1682,15 +2317,48 @@ def create_panel_layout(
                 vmax_slider.value,
             )
             bokeh_plot = hv.render(plot_obj, backend="bokeh")
-            save_bokeh_plot_html(
+            saved_html_path = save_bokeh_plot_html(
                 bokeh_plot,
                 export_path,
                 title=title,
                 plot_theme=plot_theme,
                 html_resources=html_resources,
             )
-            export_status.object = f"Saved current view to `{export_path}`"
-            LOGGER.info("Saved Panel-exported HTML snapshot to %s", export_path)
+
+            export_sv_da, export_y_coord, _ = build_plot_dataarray(ds_mvbs, selected_channel)
+            export_sv_da, export_x_coord, _, export_removed = prepare_display_dataarray(
+                export_sv_da,
+                hide_na_gaps=hide_na_gaps,
+            )
+            export_x_axis_note = describe_x_axis_mode(
+                x_coord=export_x_coord,
+                hide_na_requested=hide_na_gaps,
+                removed_count=export_removed,
+            )
+            sidecar_paths = export_plot_data_sidecars(
+                sv_da=export_sv_da,
+                selected_channel=selected_channel,
+                x_coord=export_x_coord,
+                y_coord=export_y_coord,
+                x_axis_note=export_x_axis_note,
+                hide_na_gaps=hide_na_gaps,
+                transducer_facing=transducer_facing,
+                ping_time_bin=ping_time_bin,
+                range_meter_bin=range_meter_bin,
+                html_path=saved_html_path,
+                export_mode=export_plot_data,
+                plot_data_dir=plot_data_dir,
+                csv_compression=plot_data_csv_compression,
+            )
+
+            status_lines = [f"Saved current view to `{saved_html_path}`"]
+            if sidecar_paths:
+                status_lines.append("Saved plot-data sidecars:")
+                status_lines.extend(f"- `{path}`" for path in sidecar_paths)
+            export_status.object = "\n".join(status_lines)
+            LOGGER.info("Saved Panel-exported HTML snapshot to %s", saved_html_path)
+            for sidecar_path in sidecar_paths:
+                LOGGER.info("Saved Panel plot-data sidecar to %s", sidecar_path)
         except Exception as exc:  # noqa: BLE001 - show export errors inside UI
             export_status.object = f"Export failed: `{type(exc).__name__}: {exc}`"
             LOGGER.exception("Panel export failed.")
@@ -1707,13 +2375,41 @@ def create_panel_layout(
         export_path_input,
         export_button,
         export_status,
-        width=360,
-    )
-    details = pn.pane.Markdown(status_text, sizing_mode="stretch_width")
-    layout = pn.Row(
-        controls,
-        pn.Column(details, plot_view, sizing_mode="stretch_width"),
         sizing_mode="stretch_width",
+        styles={**dark_surface_vars, "padding": "8px"} if is_dark_theme else None,
+        stylesheets=[widget_dark_stylesheet] if is_dark_theme else None,
+    )
+    details = pn.pane.Markdown(
+        status_text,
+        sizing_mode="stretch_width",
+        styles={**dark_surface_vars, "padding": "8px"} if is_dark_theme else None,
+        stylesheets=[widget_dark_stylesheet] if is_dark_theme else None,
+    )
+    controls_menu = pn.Accordion(
+        ("Controls", controls),
+        active=[],
+        sizing_mode="stretch_width",
+        styles=dark_style_vars if is_dark_theme else None,
+        stylesheets=[accordion_dark_stylesheet] if is_dark_theme else None,
+    )
+    details_menu = pn.Accordion(
+        ("Display Settings", details),
+        active=[],
+        sizing_mode="stretch_width",
+        styles=dark_style_vars if is_dark_theme else None,
+        stylesheets=[accordion_dark_stylesheet] if is_dark_theme else None,
+    )
+    top_menus = pn.Row(
+        pn.Column(controls_menu, sizing_mode="stretch_width"),
+        pn.Column(details_menu, sizing_mode="stretch_width"),
+        sizing_mode="stretch_width",
+        styles=dark_style_vars if is_dark_theme else None,
+    )
+    layout = pn.Column(
+        top_menus,
+        plot_view,
+        sizing_mode="stretch_both",
+        styles=dark_style_vars if is_dark_theme else None,
     )
     return layout
 
@@ -1917,6 +2613,33 @@ def parse_args() -> argparse.Namespace:
             "as the filename base."
         ),
     )
+    parser.add_argument(
+        "--export-plot-data",
+        type=str,
+        choices=PLOT_DATA_EXPORT_CHOICES,
+        default="netcdf",
+        help=(
+            "Export plot-consistent MVBS data sidecars when saving HTML. "
+            "'netcdf' (default) writes .mvbs.nc, 'csv' writes .mvbs.csv(.gz), "
+            "'both' writes both, and 'none' disables sidecar export."
+        ),
+    )
+    parser.add_argument(
+        "--plot-data-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional output directory for plot-data sidecars. "
+            "Defaults to the same directory as each saved HTML."
+        ),
+    )
+    parser.add_argument(
+        "--plot-data-csv-compression",
+        type=str,
+        choices=PLOT_DATA_CSV_COMPRESSION_CHOICES,
+        default="gzip",
+        help="Compression mode for CSV sidecars when --export-plot-data includes csv.",
+    )
     return parser.parse_args()
 
 
@@ -2051,21 +2774,23 @@ def main() -> None:
                 args.save_html or Path("ek80_chunked_echogram.html")
             )
             saved_paths: list[Path] = []
+            saved_sidecar_paths: list[Path] = []
             for channel_name in channels:
                 channel_da, channel_y, _ = build_plot_dataarray(ds_mvbs, channel_name)
                 channel_da, channel_x, channel_xlabel, channel_removed = prepare_display_dataarray(
                     channel_da,
                     hide_na_gaps=args.hide_na_gaps,
                 )
+                channel_x_axis_note = describe_x_axis_mode(
+                    x_coord=channel_x,
+                    hide_na_requested=args.hide_na_gaps,
+                    removed_count=channel_removed,
+                )
                 if args.hide_na_gaps:
                     LOGGER.info(
                         "Display x-axis mode for %s: %s",
                         channel_name,
-                        describe_x_axis_mode(
-                            x_coord=channel_x,
-                            hide_na_requested=True,
-                            removed_count=channel_removed,
-                        ),
+                        channel_x_axis_note,
                     )
                 channel_title = f"EK80 MVBS Echogram | {channel_name}"
                 channel_freq = infer_channel_frequency_khz(channel_name)
@@ -2098,9 +2823,29 @@ def main() -> None:
                     html_resources=args.html_resources,
                 )
                 saved_paths.append(saved_path)
+                sidecar_paths = export_plot_data_sidecars(
+                    sv_da=channel_da,
+                    selected_channel=channel_name,
+                    x_coord=channel_x,
+                    y_coord=channel_y,
+                    x_axis_note=channel_x_axis_note,
+                    hide_na_gaps=args.hide_na_gaps,
+                    transducer_facing=transducer_facing,
+                    ping_time_bin=args.ping_time_bin,
+                    range_meter_bin=args.range_meter_bin,
+                    html_path=saved_path,
+                    export_mode=args.export_plot_data,
+                    plot_data_dir=args.plot_data_dir,
+                    csv_compression=args.plot_data_csv_compression,
+                )
+                saved_sidecar_paths.extend(sidecar_paths)
             print("Saved HTML snapshots by channel:")
             for path in saved_paths:
                 print(f" - {path}")
+            if saved_sidecar_paths:
+                print("Saved plot-data sidecars:")
+                for sidecar_path in saved_sidecar_paths:
+                    print(f" - {sidecar_path}")
         elif args.save_html is not None:
             saved_path = save_bokeh_plot_html(
                 bokeh_plot,
@@ -2110,6 +2855,25 @@ def main() -> None:
                 html_resources=args.html_resources,
             )
             print(f"Saved HTML snapshot: {saved_path}")
+            sidecar_paths = export_plot_data_sidecars(
+                sv_da=sv_da,
+                selected_channel=selected_channel,
+                x_coord=x_coord,
+                y_coord=y_coord,
+                x_axis_note=x_axis_note,
+                hide_na_gaps=args.hide_na_gaps,
+                transducer_facing=transducer_facing,
+                ping_time_bin=args.ping_time_bin,
+                range_meter_bin=args.range_meter_bin,
+                html_path=saved_path,
+                export_mode=args.export_plot_data,
+                plot_data_dir=args.plot_data_dir,
+                csv_compression=args.plot_data_csv_compression,
+            )
+            if sidecar_paths:
+                print("Saved plot-data sidecars:")
+                for sidecar_path in sidecar_paths:
+                    print(f" - {sidecar_path}")
 
     print("\nProcessing summary:")
     print(f"Total files processed: {len(raw_files)}")
@@ -2140,6 +2904,11 @@ def main() -> None:
             hide_na_gaps=args.hide_na_gaps,
             html_resources=args.html_resources,
             transducer_facing=transducer_facing,
+            ping_time_bin=args.ping_time_bin,
+            range_meter_bin=args.range_meter_bin,
+            export_plot_data=args.export_plot_data,
+            plot_data_dir=args.plot_data_dir,
+            plot_data_csv_compression=args.plot_data_csv_compression,
         )
         LOGGER.info(
             "Starting Panel app (port=%s, auto_open_browser=%s)",

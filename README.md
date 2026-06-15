@@ -16,6 +16,8 @@ Main scripts:
 
 - `run_daily_lander_batch.py` - recommended production workflow
 - `ek80_chunked_echogram.py` - single-run processing/debugging
+- `analyze_mvbs_sidecars.py` - post-process `.mvbs.nc` sidecars for analysis
+- `view_mvbs_sidecars.py` - live interactive viewer for `.mvbs.nc` sidecars
 - `build_lander_timeline_viewer.py` - local timeline HTML viewer
 
 ## Install
@@ -189,6 +191,114 @@ python ek80_chunked_echogram.py `
   --ui-mode static `
   --save-html ".\outputs\one_day_check.html"
 ```
+
+## Plot-Data Sidecar Export
+
+When an HTML export is saved, the scripts now also export plot-consistent MVBS sidecar data by default.
+
+Default behavior:
+
+- `--export-plot-data netcdf` (default) writes `.mvbs.nc` sidecars
+- Sidecar base name matches HTML base name, for example:
+  - `DSB2_20250819__es70_70khz.html`
+  - `DSB2_20250819__es70_70khz.mvbs.nc`
+
+Useful flags:
+
+- `--export-plot-data none|netcdf|csv|both`
+- `--plot-data-dir <path>` (optional; defaults to HTML directory)
+- `--plot-data-csv-compression none|gzip` (used when CSV is requested)
+
+Examples:
+
+- Disable sidecars entirely:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --output-dir ".\outputs\daily" `
+  --export-plot-data none
+```
+
+- Write both NetCDF and compressed CSV sidecars:
+
+```powershell
+python run_daily_lander_batch.py `
+  --raw-dir "D:\Cruise\EK80\Raw" `
+  --output-dir ".\outputs\daily" `
+  --export-plot-data both `
+  --plot-data-csv-compression gzip
+```
+
+## Post-Process MVBS Sidecars
+
+Analysis now runs as a separate post-processing step on exported `.mvbs.nc` files.
+This avoids rerunning raw processing when tuning analysis windows.
+
+Run scalar analysis over all sidecars in an output directory:
+
+```powershell
+python analyze_mvbs_sidecars.py `
+  --input-dir ".\outputs\daily_1m_1s_analysis" `
+  --analysis-mode scalar `
+  --analysis-depth-min 20 `
+  --analysis-depth-max 80 `
+  --output-jsonl ".\outputs\daily_1m_1s_analysis\analysis_scalar.jsonl"
+```
+
+Run mean-vs-time analysis for one channel and export profile CSVs:
+
+```powershell
+python analyze_mvbs_sidecars.py `
+  --input-dir ".\outputs\daily_1m_1s_analysis" `
+  --analysis-mode mean-vs-time `
+  --channel-filter "70 kHz" `
+  --analysis-depth-min 20 `
+  --analysis-depth-max 80 `
+  --profile-csv-dir ".\outputs\daily_1m_1s_analysis\profiles" `
+  --output-jsonl ".\outputs\daily_1m_1s_analysis\analysis_mean_vs_time.jsonl"
+```
+
+Common analysis flags:
+
+- `--analysis-mode mean-vs-depth|mean-vs-time|scalar` (required)
+- `--channel <exact channel>` or `--channel-filter <substring>` (optional)
+- `--analysis-time-start <datetime>` / `--analysis-time-end <datetime>` (optional)
+- `--analysis-depth-min <float>` / `--analysis-depth-max <float>` (optional)
+- `--output-jsonl <path.jsonl>` (optional)
+- `--profile-csv-dir <dir>` (optional for profile modes)
+
+## Live Viewer from Sidecars
+
+Use `view_mvbs_sidecars.py` to open an interactive Panel app directly from
+`.mvbs.nc` sidecars. This provides real-time colormap and dB-range tuning plus
+pan/zoom interactions without reprocessing `.raw` files.
+Default colormap for this viewer is `viridis` to match batch export defaults.
+
+Example (single day):
+
+```powershell
+python view_mvbs_sidecars.py `
+  --input-dir ".\outputs\daily_1m_1s_netcdf_test" `
+  --date 20250820 `
+  --vmin -85 `
+  --vmax -55
+```
+
+Optional filters and export controls:
+
+- `--channel-filter "70 kHz"`
+- `--hide-na-gaps`
+- `--save-html ".\outputs\mvbs_sidecar_view.html"`
+- `--export-plot-data none|netcdf|csv|both`
+
+## Interpretation and Export Limits
+
+- Post-process analysis uses exported `MVBS` sidecars (binned Sv), not full-resolution ping-by-ping `Sv`.
+- Mean-Sv calculations use linear-domain averaging internally before converting back to dB.
+- For small/short ROIs, use finer MVBS bins (`--range-meter-bin`, `--ping-time-bin`) to reduce binning bias.
+- Existing exported echogram HTML files are rasterized visualization artifacts; they do not contain enough numeric MVBS data to reliably recompute new ROI statistics post hoc.
+- Use exported `.mvbs.nc` sidecars for repeatable post-hoc analysis without rerunning raw processing.
 
 ## Timeline Viewer
 
