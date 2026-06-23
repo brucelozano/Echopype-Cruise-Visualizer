@@ -26,7 +26,7 @@ import hvplot.xarray  # noqa: F401  # Registers hvplot on xarray objects
 import numpy as np
 import xarray as xr
 from bokeh.io import save
-from bokeh.models import ColorBar, CustomJSHover, CustomJSTickFormatter, HoverTool
+from bokeh.models import ColorBar, CustomJSHover, CustomJSTickFormatter, FixedTicker, HoverTool
 from bokeh.plotting import show
 from bokeh.resources import CDN, INLINE
 
@@ -766,7 +766,7 @@ def compute_mvbs_mean_sv_analysis(
     if scalar_values.size > 0 and np.isfinite(scalar_values[0]):
         scalar_mean_sv_db = float(scalar_values[0])
 
-    valid_cell_count = int(subset.notnull().sum().item())
+    valid_cell_count = int(subset.notnull().sum().values.item())
     if valid_cell_count == 0:
         raise ValueError("Selected analysis window has no valid Sv bins (all NaN).")
 
@@ -832,7 +832,7 @@ def format_analysis_summary_markdown(
 
 
 def append_analysis_record_jsonl(output_path: Path, record: dict[str, object]) -> Path:
-    """Append one analysis record to a JSONL artifact and return resolved path."""
+    """Append one analysis record to a JSONL output file and return resolved path."""
     resolved = output_path.resolve()
     if resolved.suffix.lower() != ".jsonl":
         resolved = resolved.with_suffix(".jsonl")
@@ -889,7 +889,7 @@ def list_raw_files(
     Parameters
     ----------
     raw_dir : Path
-        Directory that contains raw and sidecar files.
+        Directory that contains raw and related output files.
     max_files : int
         Maximum number of `.raw` files to process when no datetime filter is used.
     start_datetime : dt.datetime | None, optional
@@ -1197,40 +1197,41 @@ def save_bokeh_plot_html(
     return html_path
 
 
-def _resolve_plot_data_output_dir(
+def _resolve_data_output_dir(
     html_path: Path,
-    plot_data_dir: Path | None,
+    data_output_dir: Path | None,
 ) -> Path:
-    """Resolve sidecar output directory for plot-data exports."""
-    if plot_data_dir is None:
+    """Resolve MVBS data output directory for export files."""
+    if data_output_dir is None:
         output_dir = html_path.parent
     else:
-        output_dir = plot_data_dir.expanduser().resolve()
+        output_dir = data_output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
-def _plot_data_base_path(
+def _data_output_base_path(
     html_path: Path,
-    plot_data_dir: Path | None,
+    data_output_dir: Path | None,
 ) -> Path:
-    """Return base path stem used for plot-data sidecar files."""
-    output_dir = _resolve_plot_data_output_dir(html_path, plot_data_dir)
+    """Return base path stem used for MVBS data output files."""
+    output_dir = _resolve_data_output_dir(html_path, data_output_dir)
     return output_dir / html_path.stem
 
 
-def _build_plot_data_dataset(
+def _build_data_output_dataset(
     sv_da: xr.DataArray,
     selected_channel: str,
     x_coord: str,
     y_coord: str,
     x_axis_note: str,
     hide_na_gaps: bool,
+    flip_vertical: bool,
     transducer_facing: str,
     ping_time_bin: str,
     range_meter_bin: float,
 ) -> xr.Dataset:
-    """Build a metadata-rich dataset sidecar from the plotted Sv DataArray."""
+    """Build a metadata-rich MVBS output dataset from plotted Sv data."""
     plot_ds = sv_da.to_dataset(name="Sv")
     plot_ds.attrs.update(
         {
@@ -1239,6 +1240,7 @@ def _build_plot_data_dataset(
             "y_coord": y_coord,
             "x_axis_note": x_axis_note,
             "hide_na_gaps": "true" if hide_na_gaps else "false",
+            "flip_vertical": "true" if flip_vertical else "false",
             "transducer_facing": transducer_facing,
             "mvbs_ping_time_bin": ping_time_bin,
             "mvbs_range_meter_bin": float(range_meter_bin),
@@ -1250,11 +1252,11 @@ def _build_plot_data_dataset(
     return plot_ds
 
 
-def _export_plot_data_netcdf(
+def _export_data_output_netcdf(
     plot_ds: xr.Dataset,
     output_path: Path,
 ) -> Path:
-    """Write NetCDF sidecar, preferring compression when available."""
+    """Write NetCDF MVBS output, preferring compression when available."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         plot_ds.to_netcdf(
@@ -1263,7 +1265,7 @@ def _export_plot_data_netcdf(
         )
     except Exception as exc:  # noqa: BLE001 - fallback when backend lacks compression support
         LOGGER.warning(
-            "Compressed NetCDF sidecar export failed for %s (%s). "
+            "Compressed NetCDF output export failed for %s (%s). "
             "Retrying without compression.",
             output_path.name,
             exc,
@@ -1272,12 +1274,12 @@ def _export_plot_data_netcdf(
     return output_path
 
 
-def _export_plot_data_csv(
+def _export_data_output_csv(
     plot_ds: xr.Dataset,
     output_path: Path,
     csv_compression: str,
 ) -> Path:
-    """Write CSV sidecar from plotted Sv data."""
+    """Write CSV MVBS output from plotted Sv data."""
     csv_output_path = output_path
     if csv_compression == "gzip" and not csv_output_path.name.endswith(".gz"):
         csv_output_path = Path(f"{csv_output_path}.gz")
@@ -1288,22 +1290,23 @@ def _export_plot_data_csv(
     return csv_output_path
 
 
-def export_plot_data_sidecars(
+def export_data_outputs(
     sv_da: xr.DataArray,
     selected_channel: str,
     x_coord: str,
     y_coord: str,
     x_axis_note: str,
     hide_na_gaps: bool,
+    flip_vertical: bool,
     transducer_facing: str,
     ping_time_bin: str,
     range_meter_bin: float,
     html_path: Path,
     export_mode: str,
-    plot_data_dir: Path | None,
+    data_output_dir: Path | None,
     csv_compression: str,
 ) -> list[Path]:
-    """Export plotted MVBS data sidecars (NetCDF/CSV) aligned with saved HTML."""
+    """Export plotted MVBS data outputs (NetCDF/CSV) aligned with saved HTML/base path."""
     if export_mode == "none":
         return []
     if export_mode not in PLOT_DATA_EXPORT_CHOICES:
@@ -1317,24 +1320,25 @@ def export_plot_data_sidecars(
             f"Expected one of: {PLOT_DATA_CSV_COMPRESSION_CHOICES}"
         )
 
-    plot_ds = _build_plot_data_dataset(
+    plot_ds = _build_data_output_dataset(
         sv_da=sv_da,
         selected_channel=selected_channel,
         x_coord=x_coord,
         y_coord=y_coord,
         x_axis_note=x_axis_note,
         hide_na_gaps=hide_na_gaps,
+        flip_vertical=flip_vertical,
         transducer_facing=transducer_facing,
         ping_time_bin=ping_time_bin,
         range_meter_bin=range_meter_bin,
     )
-    base_path = _plot_data_base_path(html_path=html_path, plot_data_dir=plot_data_dir)
+    base_path = _data_output_base_path(html_path=html_path, data_output_dir=data_output_dir)
     saved_paths: list[Path] = []
 
     if export_mode in {"netcdf", "both"}:
         netcdf_path = Path(f"{base_path}.mvbs.nc")
         saved_paths.append(
-            _export_plot_data_netcdf(
+            _export_data_output_netcdf(
                 plot_ds=plot_ds,
                 output_path=netcdf_path,
             )
@@ -1342,13 +1346,15 @@ def export_plot_data_sidecars(
     if export_mode in {"csv", "both"}:
         csv_path = Path(f"{base_path}.mvbs.csv")
         saved_paths.append(
-            _export_plot_data_csv(
+            _export_data_output_csv(
                 plot_ds=plot_ds,
                 output_path=csv_path,
                 csv_compression=csv_compression,
             )
         )
     return saved_paths
+
+
 
 
 def _extract_echodata_channels(echodata: ep.EchoData) -> tuple[str, ...]:
@@ -1575,9 +1581,9 @@ def build_plot_dataarray(
             channel_name = inferred_channel or "unknown_channel"
         elif inferred_channel is not None and channel_name != inferred_channel:
             raise ValueError(
-                "Requested channel does not match this MVBS sidecar.\n"
+                "Requested channel does not match this MVBS NetCDF output.\n"
                 f"Requested: {channel_name}\n"
-                f"Sidecar channel: {inferred_channel}"
+                f"Output channel: {inferred_channel}"
             )
 
     if "echo_range" in sv_da.coords:
@@ -1587,14 +1593,16 @@ def build_plot_dataarray(
             non_time_dims = [dim for dim in sv_da.dims if dim != "ping_time"]
             if non_time_dims:
                 valid_ping_mask = sv_da.notnull().any(dim=non_time_dims)
-                if int(valid_ping_mask.sum().item()) > 0:
+                if int(valid_ping_mask.sum().values.item()) > 0:
                     candidate = candidate.sel(ping_time=valid_ping_mask)
             if "ping_time" in candidate.dims:
                 range_non_time_dims = [dim for dim in candidate.dims if dim != "ping_time"]
                 if range_non_time_dims:
                     valid_range_ping = candidate.notnull().any(dim=range_non_time_dims)
-                    if int(valid_range_ping.sum().item()) > 0:
-                        first_valid_idx = int(valid_range_ping.argmax(dim="ping_time").item())
+                    if int(valid_range_ping.sum().values.item()) > 0:
+                        first_valid_idx = int(
+                            valid_range_ping.argmax(dim="ping_time").values.item()
+                        )
                         candidate = candidate.isel(ping_time=first_valid_idx, drop=True)
                     else:
                         candidate = candidate.isel(ping_time=0, drop=True)
@@ -1602,7 +1610,7 @@ def build_plot_dataarray(
                     candidate = candidate.isel(ping_time=0, drop=True)
             echo_range = candidate
 
-        if int(echo_range.notnull().sum().item()) > 1:
+        if int(echo_range.notnull().sum().values.item()) > 1:
             sv_da = sv_da.assign_coords(echo_range=echo_range)
             y_coord = "echo_range"
         elif "range_sample" in sv_da.dims:
@@ -1636,7 +1644,7 @@ def collapse_na_ping_gaps(sv_da: xr.DataArray) -> tuple[xr.DataArray, int]:
         return sv_da, 0
 
     valid_ping_mask = sv_da.notnull().any(dim=non_time_dims)
-    valid_count = int(valid_ping_mask.sum().item())
+    valid_count = int(valid_ping_mask.sum().values.item())
     total_count = int(sv_da.sizes.get("ping_time", 0))
     removed_count = max(total_count - valid_count, 0)
     if valid_count < 2:
@@ -1673,7 +1681,7 @@ def prepare_display_dataarray(
     removed_count = 0
     if "ping_time" in sv_da.coords:
         valid_time_mask = sv_da["ping_time"].notnull()
-        valid_time_count = int(valid_time_mask.sum().item())
+        valid_time_count = int(valid_time_mask.sum().values.item())
         total_time_count = int(sv_da.sizes.get("ping_time", 0))
         if 0 < valid_time_count < total_time_count:
             LOGGER.warning(
@@ -1722,7 +1730,7 @@ def _axis_valid_count(coord: xr.DataArray) -> int:
         return int((~np.isnat(values)).sum())
     if np.issubdtype(values.dtype, np.number):
         return int(np.isfinite(values).sum())
-    return int(coord.notnull().sum().item())
+    return int(coord.notnull().sum().values.item())
 
 
 def _assign_index_fallback_axis(
@@ -1765,18 +1773,62 @@ def _build_collapsed_time_epoch_ms(sv_da: xr.DataArray) -> list[int]:
     return epoch_ms
 
 
+def _build_collapsed_time_tick_indices(
+    epoch_ms_values: Sequence[int], target_tick_count: int = 12
+) -> list[int]:
+    """Build readable tick positions while forcing day-transition labels."""
+    total_count = len(epoch_ms_values)
+    if total_count == 0:
+        return []
+
+    step = max(1, total_count // max(target_tick_count, 1))
+    min_spacing = max(1, step // 2)
+    regular_ticks: list[int] = list(range(0, total_count, step))
+    if regular_ticks[-1] != total_count - 1:
+        regular_ticks.append(total_count - 1)
+
+    transition_ticks: set[int] = set()
+    previous_day: dt.date | None = None
+    for idx, millis in enumerate(epoch_ms_values):
+        if not np.isfinite(millis) or millis < 0:
+            continue
+        # Use UTC day boundaries so hide-gap labels match dataset timestamps.
+        current_day = dt.datetime.utcfromtimestamp(millis / 1000.0).date()
+        if previous_day is None or current_day != previous_day:
+            transition_ticks.add(idx)
+            previous_day = current_day
+
+    selected: list[int] = sorted({0, total_count - 1, *transition_ticks})
+    selected_set = set(selected)
+    for idx in regular_ticks:
+        if idx in selected_set:
+            continue
+        if any(abs(idx - anchor) < min_spacing for anchor in selected):
+            continue
+        selected.append(idx)
+        selected_set.add(idx)
+
+    return sorted(selected)
+
+
 def _build_collapsed_time_hook(
     epoch_ms_values: list[int],
 ):
     """Create a Holoviews hook with dynamic dense-axis datetime styling."""
+    tick_indices = _build_collapsed_time_tick_indices(epoch_ms_values)
+
     hover_formatter = CustomJSHover(
         args={"epoch_ms_values": epoch_ms_values},
         code="""
             const values = epoch_ms_values || [];
-            if (!values.length || !Number.isFinite(value)) {
+            const hoverX =
+                (typeof special_vars !== "undefined" && Number.isFinite(special_vars?.x))
+                    ? special_vars.x
+                    : value;
+            if (!values.length || !Number.isFinite(hoverX)) {
                 return "NaT";
             }
-            const idx = Math.round(value);
+            const idx = Math.round(hoverX);
             if (idx < 0 || idx >= values.length) {
                 return "NaT";
             }
@@ -1785,14 +1837,29 @@ def _build_collapsed_time_hook(
                 return "NaT";
             }
             const current = new Date(millis);
+            if (!Number.isFinite(current.getTime())) {
+                return "NaT";
+            }
             const pad2 = (num) => String(num).padStart(2, "0");
-            const yyyy = current.getFullYear();
-            const mm = pad2(current.getMonth() + 1);
-            const dd = pad2(current.getDate());
-            const hh = pad2(current.getHours());
-            const min = pad2(current.getMinutes());
-            const ss = pad2(current.getSeconds());
+            const yyyy = current.getUTCFullYear();
+            const mm = pad2(current.getUTCMonth() + 1);
+            const dd = pad2(current.getUTCDate());
+            const hh = pad2(current.getUTCHours());
+            const min = pad2(current.getUTCMinutes());
+            const ss = pad2(current.getUTCSeconds());
             return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+        """,
+    )
+    y_hover_formatter = CustomJSHover(
+        code="""
+            const hoverY =
+                (typeof special_vars !== "undefined" && Number.isFinite(special_vars?.y))
+                    ? special_vars.y
+                    : value;
+            if (!Number.isFinite(hoverY)) {
+                return "n/a";
+            }
+            return Number(hoverY).toFixed(2);
         """,
     )
     tick_formatter = CustomJSTickFormatter(
@@ -1808,31 +1875,30 @@ def _build_collapsed_time_hook(
                 return "NaT";
             }
             const current = new Date(millis);
-            const timeText = current.toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-                hour12: false,
-            });
+            if (!Number.isFinite(current.getTime())) {
+                return "NaT";
+            }
+            const pad2 = (num) => String(num).padStart(2, "0");
+            const timeText = `${pad2(current.getUTCHours())}:${pad2(current.getUTCMinutes())}`;
 
-            let showDate = idx === 0;
-            if (!showDate && idx > 0) {
+            let showDate = false;
+            if (idx > 0) {
                 const prevMillis = values[idx - 1];
                 if (Number.isFinite(prevMillis) && prevMillis >= 0) {
                     const prev = new Date(prevMillis);
                     showDate =
-                        current.getFullYear() !== prev.getFullYear() ||
-                        current.getMonth() !== prev.getMonth() ||
-                        current.getDate() !== prev.getDate();
+                        current.getUTCFullYear() !== prev.getUTCFullYear() ||
+                        current.getUTCMonth() !== prev.getUTCMonth() ||
+                        current.getUTCDate() !== prev.getUTCDate();
                 }
             }
             if (!showDate) {
                 return timeText;
             }
-            const dateText = current.toLocaleDateString([], {
-                month: "short",
-                day: "numeric",
-                year: "numeric",
-            });
+            const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            const monthIdx = current.getUTCMonth();
+            const monthText = monthNames[monthIdx] ?? "???";
+            const dateText = `${monthText} ${pad2(current.getUTCDate())}`;
             return `${timeText}\\n${dateText}`;
         """,
     )
@@ -1842,22 +1908,46 @@ def _build_collapsed_time_hook(
         for hover_tool in hover_tools:
             existing_tooltips = list(hover_tool.tooltips or [])
             trailing_tooltips = existing_tooltips[1:] if existing_tooltips else [("value", "@image")]
-            hover_tool.tooltips = [("ping_time", "$x{custom}"), *trailing_tooltips]
+            rewritten_tooltips: list[tuple[str, str]] = [("ping_time", "$x{custom}")]
+            for label, field in trailing_tooltips:
+                if isinstance(field, str) and field.strip() == "$y":
+                    rewritten_tooltips.append((label, "$y{custom}"))
+                else:
+                    rewritten_tooltips.append((label, field))
+            hover_tool.tooltips = rewritten_tooltips
             updated_formatters = dict(hover_tool.formatters)
             updated_formatters["$x"] = hover_formatter
+            updated_formatters["$y"] = y_hover_formatter
             hover_tool.formatters = updated_formatters
 
         x_axes = getattr(plot.state, "xaxis", [])
         if not x_axes:
             return
         axis = x_axes[0]
+        if tick_indices:
+            axis.ticker = FixedTicker(ticks=tick_indices)
         axis.formatter = tick_formatter
         axis.major_label_orientation = 0.0
         axis.major_label_text_align = "center"
         axis.major_label_text_baseline = "top"
         axis.major_label_standoff = 10
+
+        x_range = getattr(plot.state, "x_range", None)
+        if x_range is not None and hasattr(x_range, "start") and hasattr(x_range, "end"):
+            try:
+                start = float(x_range.start)
+                end = float(x_range.end)
+                if np.isfinite(start) and np.isfinite(end) and end > start:
+                    pad = max((end - start) * 0.01, 1.0)
+                    x_range.start = start - pad
+                    x_range.end = end + pad
+            except (TypeError, ValueError):
+                pass
+
+        current_left = getattr(plot.state, "min_border_left", 0) or 0
+        plot.state.min_border_left = max(current_left, 74)
         current_bottom = getattr(plot.state, "min_border_bottom", 0) or 0
-        plot.state.min_border_bottom = max(current_bottom, 62)
+        plot.state.min_border_bottom = max(current_bottom, 68)
 
     return _hook
 
@@ -1935,6 +2025,7 @@ def create_echogram_plot(
     plot_theme: str,
     plot_sizing: str,
     transducer_facing: str,
+    flip_vertical: bool,
 ) -> hv.core.Dimensioned:
     """Create an interactive hvPlot echogram.
 
@@ -1962,6 +2053,8 @@ def create_echogram_plot(
         Plot sizing mode ("responsive" or "fixed").
     transducer_facing : str
         Effective transducer facing mode ("down" or "up").
+    flip_vertical : bool
+        If True, flip the rendered y-axis orientation from its default.
 
     Returns
     -------
@@ -1995,6 +2088,9 @@ def create_echogram_plot(
             y_coord,
         )
     down_looking = transducer_facing != "up"
+    invert_yaxis = down_looking
+    if flip_vertical:
+        invert_yaxis = not invert_yaxis
     if y_coord_safe == "echo_range":
         ylabel = "Depth (m)" if down_looking else "Range Above Transducer (m)"
     else:
@@ -2063,7 +2159,7 @@ def create_echogram_plot(
         )
         tick_hook = None
     opt_kwargs = {
-        "invert_yaxis": down_looking,
+        "invert_yaxis": invert_yaxis,
         "active_tools": ["wheel_zoom"],
         "fontsize": {"title": "12pt", "labels": "10pt", "xticks": "9pt", "yticks": "9pt"},
     }
@@ -2094,11 +2190,12 @@ def create_panel_layout(
     hide_na_gaps: bool,
     html_resources: str,
     transducer_facing: str,
+    flip_vertical: bool,
     ping_time_bin: str,
     range_meter_bin: float,
-    export_plot_data: str,
-    plot_data_dir: Path | None,
-    plot_data_csv_compression: str,
+    data_output_format: str,
+    data_output_dir: Path | None,
+    data_csv_compression: str,
 ):
     """Create a Panel layout for interactive echogram parameter tuning."""
     import panel as pn
@@ -2261,6 +2358,7 @@ label, span, p {
             plot_theme=plot_theme,
             plot_sizing=plot_sizing,
             transducer_facing=transducer_facing,
+            flip_vertical=flip_vertical,
         )
         return plot_obj, selected_channel, title, plot_vmin, plot_vmax, x_axis_note
 
@@ -2294,7 +2392,8 @@ label, span, p {
             f"- dB range: `{plot_vmin} to {plot_vmax}`\n"
             f"- X-axis: `{x_axis_note}`\n"
             f"- Transducer facing: `{transducer_facing}`\n"
-            f"- Plot-data sidecars: `{export_plot_data}`\n"
+            f"- Vertical flip: `{'enabled' if flip_vertical else 'disabled'}`\n"
+            f"- MVBS data output format: `{data_output_format}`\n"
             "- Data source: `MVBS` (binned Sv), not raw ping-by-ping Sv."
         )
 
@@ -2335,30 +2434,31 @@ label, span, p {
                 hide_na_requested=hide_na_gaps,
                 removed_count=export_removed,
             )
-            sidecar_paths = export_plot_data_sidecars(
+            data_output_paths = export_data_outputs(
                 sv_da=export_sv_da,
                 selected_channel=selected_channel,
                 x_coord=export_x_coord,
                 y_coord=export_y_coord,
                 x_axis_note=export_x_axis_note,
                 hide_na_gaps=hide_na_gaps,
+                flip_vertical=flip_vertical,
                 transducer_facing=transducer_facing,
                 ping_time_bin=ping_time_bin,
                 range_meter_bin=range_meter_bin,
                 html_path=saved_html_path,
-                export_mode=export_plot_data,
-                plot_data_dir=plot_data_dir,
-                csv_compression=plot_data_csv_compression,
+                export_mode=data_output_format,
+                data_output_dir=data_output_dir,
+                csv_compression=data_csv_compression,
             )
 
             status_lines = [f"Saved current view to `{saved_html_path}`"]
-            if sidecar_paths:
-                status_lines.append("Saved plot-data sidecars:")
-                status_lines.extend(f"- `{path}`" for path in sidecar_paths)
+            if data_output_paths:
+                status_lines.append("Saved MVBS data outputs:")
+                status_lines.extend(f"- `{path}`" for path in data_output_paths)
             export_status.object = "\n".join(status_lines)
             LOGGER.info("Saved Panel-exported HTML snapshot to %s", saved_html_path)
-            for sidecar_path in sidecar_paths:
-                LOGGER.info("Saved Panel plot-data sidecar to %s", sidecar_path)
+            for output_path in data_output_paths:
+                LOGGER.info("Saved Panel MVBS data output to %s", output_path)
         except Exception as exc:  # noqa: BLE001 - show export errors inside UI
             export_status.object = f"Export failed: `{type(exc).__name__}: {exc}`"
             LOGGER.exception("Panel export failed.")
@@ -2506,13 +2606,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vmax",
         type=float,
-        default=-30.0,
+        default=-55.0,
         help="Upper color limit in dB.",
     )
     parser.add_argument(
         "--cmap",
         type=str,
-        default="RdYlBu_r",
+        default="viridis",
         help="Colormap for echogram rendering.",
     )
     parser.add_argument(
@@ -2531,10 +2631,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hide-na-gaps",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Display-only option: drop all-NaN ping bins and plot a dense x-axis "
-            "to hide duty-cycle time gaps while retaining datetime tick labels."
+            "to hide duty-cycle time gaps while retaining datetime tick labels. "
+            "Enabled by default; use --no-hide-na-gaps to disable."
         ),
     )
     parser.add_argument(
@@ -2545,6 +2647,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Vertical orientation mode for echogram rendering. "
             "'auto' tries per-day metadata inference and falls back to down-looking."
+        ),
+    )
+    parser.add_argument(
+        "--flip-vertical",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Flip rendered echogram vertically after orientation is resolved "
+            "(applies to static exports and Panel views). "
+            "Enabled by default; use --no-flip-vertical to disable."
         ),
     )
     parser.add_argument(
@@ -2596,6 +2708,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skip-html",
+        action="store_true",
+        help=(
+            "In static mode, skip HTML writing and export only MVBS data outputs "
+            "configured by --data-output-format. "
+            "The --save-html path is still used as the output filename base."
+        ),
+    )
+    parser.add_argument(
         "--html-resources",
         type=str,
         choices=["inline", "cdn"],
@@ -2609,36 +2730,39 @@ def parse_args() -> argparse.Namespace:
         "--export-all-channels",
         action="store_true",
         help=(
-            "In static mode, export one HTML per detected channel using --save-html "
-            "as the filename base."
+            "In static mode, export one output set per detected channel using "
+            "--save-html as the filename base."
         ),
     )
     parser.add_argument(
-        "--export-plot-data",
+        "--data-output-format",
+        dest="data_output_format",
         type=str,
         choices=PLOT_DATA_EXPORT_CHOICES,
         default="netcdf",
         help=(
-            "Export plot-consistent MVBS data sidecars when saving HTML. "
+            "Export plot-consistent MVBS data outputs in static/panel export flows. "
             "'netcdf' (default) writes .mvbs.nc, 'csv' writes .mvbs.csv(.gz), "
-            "'both' writes both, and 'none' disables sidecar export."
+            "'both' writes both, and 'none' disables data export."
         ),
     )
     parser.add_argument(
-        "--plot-data-dir",
+        "--data-output-dir",
+        dest="data_output_dir",
         type=Path,
         default=None,
         help=(
-            "Optional output directory for plot-data sidecars. "
-            "Defaults to the same directory as each saved HTML."
+            "Optional output directory for MVBS data outputs. "
+            "Defaults to the same directory as each saved HTML (or base output path in --skip-html mode)."
         ),
     )
     parser.add_argument(
-        "--plot-data-csv-compression",
+        "--data-csv-compression",
+        dest="data_csv_compression",
         type=str,
         choices=PLOT_DATA_CSV_COMPRESSION_CHOICES,
         default="gzip",
-        help="Compression mode for CSV sidecars when --export-plot-data includes csv.",
+        help="Compression mode for CSV outputs when --data-output-format includes csv.",
     )
     return parser.parse_args()
 
@@ -2647,6 +2771,13 @@ def main() -> None:
     """Run chunked EK80 processing and open interactive echogram."""
     args = parse_args()
     configure_logging(args.log_level)
+    if args.ui_mode == "panel" and args.skip_html:
+        LOGGER.warning("--skip-html applies to static mode only; ignoring in panel mode.")
+    if args.ui_mode != "panel" and args.skip_html and args.data_output_format == "none":
+        raise ValueError(
+            "--skip-html requires --data-output-format netcdf/csv/both in static mode "
+            "(otherwise no output files would be produced)."
+        )
     if args.raw_dir is None:
         raise ValueError(
             "Missing raw input directory. Pass --raw-dir or set EK80_RAW_DIR."
@@ -2745,23 +2876,26 @@ def main() -> None:
     if selected_freq is not None:
         plot_title = f"{plot_title} ({selected_freq} kHz)"
 
-    echogram = create_echogram_plot(
-        sv_da=sv_da,
-        y_coord=y_coord,
-        x_coord=x_coord,
-        x_label=x_label,
-        vmin=plot_vmin,
-        vmax=plot_vmax,
-        cmap=args.cmap,
-        width=args.width,
-        height=args.height,
-        title=plot_title,
-        plot_theme=args.plot_theme,
-        plot_sizing=args.plot_sizing,
-        transducer_facing=transducer_facing,
-    )
-    bokeh_plot = hv.render(echogram, backend="bokeh")
-    apply_bokeh_plot_theme(bokeh_plot, plot_theme=args.plot_theme)
+    bokeh_plot = None
+    if args.ui_mode != "panel" and not args.export_all_channels and not args.skip_html:
+        echogram = create_echogram_plot(
+            sv_da=sv_da,
+            y_coord=y_coord,
+            x_coord=x_coord,
+            x_label=x_label,
+            vmin=plot_vmin,
+            vmax=plot_vmax,
+            cmap=args.cmap,
+            width=args.width,
+            height=args.height,
+            title=plot_title,
+            plot_theme=args.plot_theme,
+            plot_sizing=args.plot_sizing,
+            transducer_facing=transducer_facing,
+            flip_vertical=args.flip_vertical,
+        )
+        bokeh_plot = hv.render(echogram, backend="bokeh")
+        apply_bokeh_plot_theme(bokeh_plot, plot_theme=args.plot_theme)
 
     if args.export_all_channels and args.ui_mode == "panel":
         LOGGER.warning(
@@ -2774,7 +2908,7 @@ def main() -> None:
                 args.save_html or Path("ek80_chunked_echogram.html")
             )
             saved_paths: list[Path] = []
-            saved_sidecar_paths: list[Path] = []
+            saved_data_output_paths: list[Path] = []
             for channel_name in channels:
                 channel_da, channel_y, _ = build_plot_dataarray(ds_mvbs, channel_name)
                 channel_da, channel_x, channel_xlabel, channel_removed = prepare_display_dataarray(
@@ -2796,84 +2930,105 @@ def main() -> None:
                 channel_freq = infer_channel_frequency_khz(channel_name)
                 if channel_freq is not None:
                     channel_title = f"{channel_title} ({channel_freq} kHz)"
-                channel_plot = create_echogram_plot(
-                    sv_da=channel_da,
-                    y_coord=channel_y,
-                    x_coord=channel_x,
-                    x_label=channel_xlabel,
-                    vmin=plot_vmin,
-                    vmax=plot_vmax,
-                    cmap=args.cmap,
-                    width=args.width,
-                    height=args.height,
-                    title=channel_title,
-                    plot_theme=args.plot_theme,
-                    plot_sizing=args.plot_sizing,
-                    transducer_facing=transducer_facing,
-                )
-                channel_bokeh = hv.render(channel_plot, backend="bokeh")
                 channel_path = base_output_path.with_name(
                     f"{base_output_path.stem}__{channel_slug(channel_name)}{base_output_path.suffix}"
                 )
-                saved_path = save_bokeh_plot_html(
-                    channel_bokeh,
-                    channel_path,
-                    channel_title,
-                    plot_theme=args.plot_theme,
-                    html_resources=args.html_resources,
-                )
-                saved_paths.append(saved_path)
-                sidecar_paths = export_plot_data_sidecars(
+                data_output_base_path = channel_path
+                if not args.skip_html:
+                    channel_plot = create_echogram_plot(
+                        sv_da=channel_da,
+                        y_coord=channel_y,
+                        x_coord=channel_x,
+                        x_label=channel_xlabel,
+                        vmin=plot_vmin,
+                        vmax=plot_vmax,
+                        cmap=args.cmap,
+                        width=args.width,
+                        height=args.height,
+                        title=channel_title,
+                        plot_theme=args.plot_theme,
+                        plot_sizing=args.plot_sizing,
+                        transducer_facing=transducer_facing,
+                        flip_vertical=args.flip_vertical,
+                    )
+                    channel_bokeh = hv.render(channel_plot, backend="bokeh")
+                    saved_path = save_bokeh_plot_html(
+                        channel_bokeh,
+                        channel_path,
+                        channel_title,
+                        plot_theme=args.plot_theme,
+                        html_resources=args.html_resources,
+                    )
+                    saved_paths.append(saved_path)
+                    data_output_base_path = saved_path
+                data_output_paths = export_data_outputs(
                     sv_da=channel_da,
                     selected_channel=channel_name,
                     x_coord=channel_x,
                     y_coord=channel_y,
                     x_axis_note=channel_x_axis_note,
                     hide_na_gaps=args.hide_na_gaps,
+                    flip_vertical=args.flip_vertical,
                     transducer_facing=transducer_facing,
                     ping_time_bin=args.ping_time_bin,
                     range_meter_bin=args.range_meter_bin,
-                    html_path=saved_path,
-                    export_mode=args.export_plot_data,
-                    plot_data_dir=args.plot_data_dir,
-                    csv_compression=args.plot_data_csv_compression,
+                    html_path=data_output_base_path,
+                    export_mode=args.data_output_format,
+                    data_output_dir=args.data_output_dir,
+                    csv_compression=args.data_csv_compression,
                 )
-                saved_sidecar_paths.extend(sidecar_paths)
-            print("Saved HTML snapshots by channel:")
-            for path in saved_paths:
-                print(f" - {path}")
-            if saved_sidecar_paths:
-                print("Saved plot-data sidecars:")
-                for sidecar_path in saved_sidecar_paths:
-                    print(f" - {sidecar_path}")
-        elif args.save_html is not None:
-            saved_path = save_bokeh_plot_html(
-                bokeh_plot,
-                args.save_html,
-                plot_title,
-                plot_theme=args.plot_theme,
-                html_resources=args.html_resources,
+                saved_data_output_paths.extend(data_output_paths)
+            if saved_paths:
+                print("Saved HTML snapshots by channel:")
+                for path in saved_paths:
+                    print(f" - {path}")
+            elif args.skip_html:
+                print("Skipped HTML snapshot export by channel (--skip-html).")
+            if saved_data_output_paths:
+                print("Saved MVBS data outputs:")
+                for output_path in saved_data_output_paths:
+                    print(f" - {output_path}")
+        else:
+            base_output_path = resolve_html_output_path(
+                args.save_html or Path("ek80_chunked_echogram.html")
             )
-            print(f"Saved HTML snapshot: {saved_path}")
-            sidecar_paths = export_plot_data_sidecars(
-                sv_da=sv_da,
-                selected_channel=selected_channel,
-                x_coord=x_coord,
-                y_coord=y_coord,
-                x_axis_note=x_axis_note,
-                hide_na_gaps=args.hide_na_gaps,
-                transducer_facing=transducer_facing,
-                ping_time_bin=args.ping_time_bin,
-                range_meter_bin=args.range_meter_bin,
-                html_path=saved_path,
-                export_mode=args.export_plot_data,
-                plot_data_dir=args.plot_data_dir,
-                csv_compression=args.plot_data_csv_compression,
-            )
-            if sidecar_paths:
-                print("Saved plot-data sidecars:")
-                for sidecar_path in sidecar_paths:
-                    print(f" - {sidecar_path}")
+            saved_path: Path | None = None
+            if args.save_html is not None and not args.skip_html:
+                if bokeh_plot is None:
+                    raise RuntimeError("Expected Bokeh plot for HTML export, but none was generated.")
+                saved_path = save_bokeh_plot_html(
+                    bokeh_plot,
+                    args.save_html,
+                    plot_title,
+                    plot_theme=args.plot_theme,
+                    html_resources=args.html_resources,
+                )
+                print(f"Saved HTML snapshot: {saved_path}")
+            elif args.skip_html and args.save_html is not None:
+                print("Skipped HTML snapshot export (--skip-html).")
+
+            data_output_paths: list[Path] = []
+            if args.data_output_format != "none" and (args.skip_html or args.save_html is not None):
+                data_output_paths = export_data_outputs(
+                    sv_da=sv_da,
+                    selected_channel=selected_channel,
+                    x_coord=x_coord,
+                    y_coord=y_coord,
+                    x_axis_note=x_axis_note,
+                    hide_na_gaps=args.hide_na_gaps,
+                    flip_vertical=args.flip_vertical,
+                    transducer_facing=transducer_facing,
+                    ping_time_bin=args.ping_time_bin,
+                    range_meter_bin=args.range_meter_bin,
+                    html_path=saved_path or base_output_path,
+                    export_mode=args.data_output_format,
+                    data_output_dir=args.data_output_dir,
+                    csv_compression=args.data_csv_compression,
+                )
+            if data_output_paths:
+                print("Saved MVBS data outputs:")
+                for output_path in data_output_paths:
+                    print(f" - {output_path}")
 
     print("\nProcessing summary:")
     print(f"Total files processed: {len(raw_files)}")
@@ -2904,11 +3059,12 @@ def main() -> None:
             hide_na_gaps=args.hide_na_gaps,
             html_resources=args.html_resources,
             transducer_facing=transducer_facing,
+            flip_vertical=args.flip_vertical,
             ping_time_bin=args.ping_time_bin,
             range_meter_bin=args.range_meter_bin,
-            export_plot_data=args.export_plot_data,
-            plot_data_dir=args.plot_data_dir,
-            plot_data_csv_compression=args.plot_data_csv_compression,
+            data_output_format=args.data_output_format,
+            data_output_dir=args.data_output_dir,
+            data_csv_compression=args.data_csv_compression,
         )
         LOGGER.info(
             "Starting Panel app (port=%s, auto_open_browser=%s)",
@@ -2921,7 +3077,7 @@ def main() -> None:
             port=args.panel_port,
             show=not args.panel_no_browser,
         )
-    else:
+    elif not args.skip_html and not args.export_all_channels and args.save_html is None and bokeh_plot is not None:
         show(bokeh_plot)
 
 

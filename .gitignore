@@ -1,4 +1,4 @@
-# Python cache/artifacts
+# Python cache/output files
 __pycache__/
 *.py[cod]
 

@@ -1,7 +1,7 @@
 """Build a lightweight local timeline viewer for daily echogram HTML exports.
 
 This utility scans a directory of daily HTML outputs (for example, files produced
-by ``run_daily_lander_batch.py``) and creates a single HTML page with:
+by ``run_daily_batch.py``) and creates a single HTML page with:
 - Channel selector
 - Date stepping (prev/next)
 - Autoplay through daily pages
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional filename prefix filter (case-insensitive). "
-            "For example, 'lander' or 'DSB2'."
+            "For example, 'cruise' or 'DSB2'."
         ),
     )
     parser.add_argument(
