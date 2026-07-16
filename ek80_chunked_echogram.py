@@ -8,6 +8,7 @@ a static interactive Bokeh echogram or a live Panel app with plot controls.
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import gc
 import inspect
@@ -49,6 +50,12 @@ ANALYSIS_MODE_LABELS = {
 }
 PLOT_DATA_EXPORT_CHOICES = ("none", "netcdf", "csv", "both")
 PLOT_DATA_CSV_COMPRESSION_CHOICES = ("none", "gzip")
+EK80_BB_TX_PARAM_NAMES = (
+    "transmit_duration_nominal",
+    "slope",
+    "transmit_frequency_start",
+    "transmit_frequency_stop",
+)
 
 
 def _path_from_env(var_name: str) -> Path | None:
@@ -1024,6 +1031,224 @@ def _sv_candidate_kwargs(
     return deduped
 
 
+def _is_changing_bb_transmit_param_error(exc: Exception) -> bool:
+    """Return True when echopype raises changing-BB-parameter calibration errors."""
+    return isinstance(exc, TypeError) and "File contains changing " in str(exc)
+
+
+def _is_tau_effective_merge_error(exc: Exception) -> bool:
+    """Return True when xarray merge errors indicate tau_effective conflicts."""
+    message = str(exc).lower()
+    return (
+        isinstance(exc, xr.MergeError)
+        and "conflicting values for variable" in message
+        and "tau_effective" in message
+    )
+
+
+def _is_bb_complex_channel_fallback_error(exc: Exception) -> bool:
+    """Return True when BB/complex should retry with per-channel fallback."""
+    return _is_changing_bb_transmit_param_error(exc) or _is_tau_effective_merge_error(exc)
+
+
+def _subset_echodata_copy(
+    echodata: ep.EchoData,
+    channel_names: Sequence[str] | None = None,
+    ping_times: np.ndarray | None = None,
+) -> ep.EchoData:
+    """Return a deep-copied EchoData optionally subset by channel and ping_time."""
+    subset = copy.deepcopy(echodata)
+    requested_channels = tuple(str(name) for name in channel_names) if channel_names else None
+    requested_ping_times = np.asarray(ping_times) if ping_times is not None else None
+
+    for group_path in subset.group_paths:
+        group_ds = subset[group_path]
+        if requested_channels and ("channel" in group_ds.dims or "channel" in group_ds.coords):
+            available_channels = [str(value) for value in np.asarray(group_ds["channel"].values).tolist()]
+            matching_channels = [name for name in requested_channels if name in available_channels]
+            if matching_channels:
+                group_ds = group_ds.sel(channel=matching_channels)
+        if requested_ping_times is not None and ("ping_time" in group_ds.dims or "ping_time" in group_ds.coords):
+            group_ds = group_ds.sel(ping_time=requested_ping_times)
+        subset[group_path] = group_ds
+    return subset
+
+
+def _group_ping_indices_by_tx_params(
+    beam_ds: xr.Dataset,
+    channel_name: str,
+) -> dict[tuple[float, ...], np.ndarray]:
+    """Group ping indices by BB transmit-parameter tuples for one channel."""
+    param_arrays: list[np.ndarray] = []
+    for param_name in EK80_BB_TX_PARAM_NAMES:
+        if param_name not in beam_ds:
+            raise KeyError(
+                f"Required EK80 BB parameter '{param_name}' missing from Sonar/Beam_group1."
+            )
+        values = np.asarray(beam_ds[param_name].sel(channel=channel_name).values, dtype=float).ravel()
+        param_arrays.append(values)
+
+    tx_matrix = np.stack(param_arrays, axis=1)
+    valid_mask = np.all(np.isfinite(tx_matrix), axis=1)
+    if not valid_mask.any():
+        raise ValueError(
+            f"Channel '{channel_name}' has no finite transmit parameter rows for BB fallback."
+        )
+
+    grouped_indices: dict[tuple[float, ...], list[int]] = {}
+    valid_indices = np.nonzero(valid_mask)[0]
+    for ping_idx, row in zip(valid_indices, tx_matrix[valid_mask]):
+        key = tuple(float(value) for value in row.tolist())
+        grouped_indices.setdefault(key, []).append(int(ping_idx))
+
+    # Assign rows with NaN transmit metadata to the dominant finite-key group so
+    # channel/ping alignment stays intact when building fallback subsets.
+    dominant_key = max(grouped_indices.items(), key=lambda item: len(item[1]))[0]
+    for ping_idx in np.nonzero(~valid_mask)[0]:
+        grouped_indices[dominant_key].append(int(ping_idx))
+
+    return {
+        key: np.asarray(sorted(indices), dtype=np.int64)
+        for key, indices in grouped_indices.items()
+    }
+
+
+def _compute_sv_with_bb_tx_param_segmentation(
+    echodata: ep.EchoData,
+) -> xr.Dataset:
+    """Compute BB/complex Sv by segmenting channels with changing tx parameters."""
+    if "Sonar/Beam_group1" not in echodata.group_paths:
+        raise KeyError("EchoData missing Sonar/Beam_group1 required for BB fallback.")
+
+    beam_ds = echodata["Sonar/Beam_group1"]
+    if "channel" not in beam_ds.coords:
+        raise KeyError("Sonar/Beam_group1 is missing channel coordinate required for BB fallback.")
+    if "ping_time" not in beam_ds.coords and "ping_time" not in beam_ds.dims:
+        raise KeyError("Sonar/Beam_group1 is missing ping_time coordinate required for BB fallback.")
+
+    channel_names = [str(value) for value in np.asarray(beam_ds["channel"].values).tolist()]
+    ping_time_values = np.asarray(beam_ds["ping_time"].values)
+    channel_results: list[xr.Dataset] = []
+
+    for channel_name in channel_names:
+        ping_groups = _group_ping_indices_by_tx_params(beam_ds=beam_ds, channel_name=channel_name)
+        if len(ping_groups) > 1:
+            LOGGER.warning(
+                "Channel %s has %d BB transmit-parameter groups; calibrating in segmented fallback mode.",
+                channel_name,
+                len(ping_groups),
+            )
+
+        group_results: list[xr.Dataset] = []
+        sorted_groups = sorted(ping_groups.items(), key=lambda item: int(item[1][0]))
+        for group_key, ping_indices in sorted_groups:
+            group_ping_times = ping_time_values[ping_indices]
+            channel_subset = _subset_echodata_copy(
+                echodata=echodata,
+                channel_names=[channel_name],
+                ping_times=group_ping_times,
+            )
+            group_ds_sv = ep.calibrate.compute_Sv(
+                channel_subset,
+                waveform_mode="BB",
+                encode_mode="complex",
+            )
+            group_results.append(group_ds_sv)
+            LOGGER.info(
+                "Segmented BB fallback channel=%s pings=%d tx_params=%s",
+                channel_name,
+                int(ping_indices.size),
+                group_key,
+            )
+
+        if len(group_results) == 1:
+            channel_ds_sv = group_results[0]
+        else:
+            channel_ds_sv = xr.concat(
+                group_results,
+                dim="ping_time",
+                data_vars="minimal",
+                coords="minimal",
+                compat="override",
+                combine_attrs="override",
+                join="outer",
+            ).sortby("ping_time")
+
+        channel_results.append(channel_ds_sv)
+
+    if len(channel_results) == 1:
+        return channel_results[0]
+
+    return xr.concat(
+        channel_results,
+        dim="channel",
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+        combine_attrs="override",
+        join="outer",
+    ).sortby("channel")
+
+
+def _compute_sv_with_bb_channel_fallback(
+    echodata: ep.EchoData,
+) -> xr.Dataset:
+    """Compute BB/complex Sv by calibrating one channel at a time."""
+    if "Sonar/Beam_group1" not in echodata.group_paths:
+        raise KeyError("EchoData missing Sonar/Beam_group1 required for BB channel fallback.")
+
+    beam_ds = echodata["Sonar/Beam_group1"]
+    if "channel" not in beam_ds.coords:
+        raise KeyError("Sonar/Beam_group1 is missing channel coordinate required for BB channel fallback.")
+
+    channel_names = [str(value) for value in np.asarray(beam_ds["channel"].values).tolist()]
+    if not channel_names:
+        raise ValueError("No channels available for BB channel fallback.")
+
+    channel_results: list[xr.Dataset] = []
+    for channel_name in channel_names:
+        channel_subset = _subset_echodata_copy(
+            echodata=echodata,
+            channel_names=[channel_name],
+        )
+        try:
+            channel_ds_sv = ep.calibrate.compute_Sv(
+                channel_subset,
+                waveform_mode="BB",
+                encode_mode="complex",
+            )
+        except Exception as channel_exc:  # noqa: BLE001 - channel-level fallback for changing tx params
+            if _is_bb_complex_channel_fallback_error(channel_exc):
+                channel_fallback_reason = (
+                    "tau_effective merge conflicts"
+                    if _is_tau_effective_merge_error(channel_exc)
+                    else "changing BB transmit parameters"
+                )
+                LOGGER.warning(
+                    "Channel %s still has %s; "
+                    "attempting segmented fallback for this channel.",
+                    channel_name,
+                    channel_fallback_reason,
+                )
+                channel_ds_sv = _compute_sv_with_bb_tx_param_segmentation(channel_subset)
+            else:
+                raise
+        channel_results.append(channel_ds_sv)
+
+    if len(channel_results) == 1:
+        return channel_results[0]
+
+    return xr.concat(
+        channel_results,
+        dim="channel",
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+        combine_attrs="override",
+        join="outer",
+    ).sortby("channel")
+
+
 def compute_sv_with_fallback(
     echodata: ep.EchoData,
     waveform_mode: str | None,
@@ -1058,6 +1283,29 @@ def compute_sv_with_fallback(
             ds_sv = ep.calibrate.compute_Sv(echodata, **candidate)
             return ds_sv, candidate
         except Exception as exc:  # noqa: BLE001 - continue through known EK80 mode mismatches
+            if (
+                candidate["waveform_mode"] == "BB"
+                and candidate["encode_mode"] == "complex"
+                and _is_bb_complex_channel_fallback_error(exc)
+            ):
+                fallback_reason = (
+                    "tau_effective merge conflicts"
+                    if _is_tau_effective_merge_error(exc)
+                    else "changing transmit parameters"
+                )
+                LOGGER.warning(
+                    "BB/complex calibration failed due to %s; "
+                    "attempting per-channel fallback.",
+                    fallback_reason,
+                )
+                try:
+                    ds_sv = _compute_sv_with_bb_channel_fallback(echodata)
+                    return ds_sv, candidate
+                except Exception as fallback_exc:  # noqa: BLE001 - preserve original candidate retry flow
+                    errors.append(
+                        "BB/complex per-channel fallback failed: "
+                        f"{type(fallback_exc).__name__}: {fallback_exc}"
+                    )
             errors.append(
                 f"{candidate['waveform_mode']}/{candidate['encode_mode']}: {type(exc).__name__}: {exc}"
             )

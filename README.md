@@ -20,6 +20,8 @@ Main scripts:
 - `view_mvbs_outputs.py` - live interactive viewer for `.mvbs.nc` outputs
 - `build_cruise_timeline_viewer.py` - local timeline HTML viewer
 
+
+
 ## Install
 
 - Python 3.10+
@@ -43,12 +45,16 @@ Example:
 
 - `...D20250828-T230017.raw`
 
+
+
 ## Recommended Workflow
 
 1. Run one daily batch export (NetCDF outputs by default).
 2. Inspect NetCDF outputs with `view_mvbs_outputs.py`.
 3. Run post-process analysis with `analyze_mvbs_outputs.py`.
 4. Optionally generate ready-to-open HTML snapshots from NetCDF outputs (standalone or as a post-batch step).
+
+
 
 ## Core Batch Command (Default NetCDF-First)
 
@@ -83,6 +89,8 @@ Default display settings (batch + viewer/headless export):
 - `--vmax -55`
 - `--hide-na-gaps` enabled (use `--no-hide-na-gaps` to disable)
 - `--flip-vertical` enabled (use `--no-flip-vertical` to disable)
+
+
 
 ## High-Detail Batch Command (Typical Pattern)
 
@@ -130,10 +138,12 @@ What those flags control:
 Output filename prefix behavior:
 
 - By default, batch exports infer prefix from raw filenames before `DYYYYMMDD-THHMMSS`
-  (for example, `DSB2_-D20250819-T150600.raw` -> prefix `DSB2`)
+(for example, `DSB2_-D20250819-T150600.raw` -> prefix `DSB2`)
 - If inference fails, prefix falls back to `cruise`
 - Prefix casing from raw filenames is preserved
 - Override manually with `--output-prefix`
+
+
 
 ## Transducer Metadata and Orientation
 
@@ -154,7 +164,9 @@ Notes:
 
 - Many datasets do not populate `beam_direction_z`; in that case auto mode logs a warning and defaults to down-looking.
 - For batch runs, pass the same options through `run_daily_batch.py` using
-  `--transducer-facing` and optionally `--flip-vertical`.
+`--transducer-facing` and optionally `--flip-vertical`.
+
+
 
 ## Hide Duty-Cycle Gaps (Experimental)
 
@@ -184,6 +196,8 @@ python run_daily_batch.py `
   --skip-existing
 ```
 
+
+
 ## Single-Run Script (Optional)
 
 Useful for quick checks before full batch runs:
@@ -209,6 +223,8 @@ python ek80_chunked_echogram.py `
   --ui-mode static `
   --save-html ".\outputs\one_day_check.html"
 ```
+
+
 
 ## MVBS Data Output Export
 
@@ -272,6 +288,8 @@ python run_daily_batch.py `
   --data-csv-compression gzip
 ```
 
+
+
 ## Post-Process MVBS NetCDF Outputs
 
 Analysis now runs as a separate post-processing step on exported `.mvbs.nc` files.
@@ -309,6 +327,8 @@ Common analysis flags:
 - `--analysis-depth-min <float>` / `--analysis-depth-max <float>` (optional)
 - `--output-jsonl <path.jsonl>` (optional)
 - `--profile-csv-dir <dir>` (optional for profile modes)
+
+
 
 ## Live Viewer from NetCDF Outputs
 
@@ -349,6 +369,8 @@ Optional filters and export controls:
 - `--save-html ".\outputs\mvbs_netcdf_view.html"`
 - `--data-output-format none|netcdf|csv|both`
 
+
+
 ## Headless HTML Export from NetCDF Outputs
 
 You can generate static HTML snapshots directly from `.mvbs.nc` outputs without opening
@@ -381,6 +403,8 @@ Useful headless flags:
 - `--export-html-no-index` (skip index page creation)
 - `--channel-filter "<substring>"` (export only selected channels)
 
+
+
 ## Post-Batch Auto HTML Export
 
 To keep NetCDF as the primary pipeline output while still getting ready-to-open HTML
@@ -409,6 +433,8 @@ Notes:
 - Default glob pattern for this step is `<output-prefix>_*.mvbs.nc` (override with `--viewer-export-glob-pattern`).
 - To disable the new default render behavior, add `--no-hide-na-gaps` and/or `--no-flip-vertical`.
 
+
+
 ## Interpretation and Export Limits
 
 - Post-process analysis uses exported `MVBS` outputs (binned Sv), not full-resolution ping-by-ping `Sv`.
@@ -416,6 +442,8 @@ Notes:
 - For small/short ROIs, use finer MVBS bins (`--range-meter-bin`, `--ping-time-bin`) to reduce binning bias.
 - Existing exported echogram HTML files are rasterized visualization outputs; they do not contain enough numeric MVBS data to reliably recompute new ROI statistics post hoc.
 - Use exported `.mvbs.nc` outputs for repeatable post-hoc analysis without rerunning raw processing.
+
+
 
 ## Timeline Viewer
 
@@ -446,6 +474,8 @@ Open:
 - `http://localhost:8000/<prefix>_timeline_viewer.html` (single-prefix directory)
 - `http://localhost:8000/timeline_viewer.html` (mixed-prefix directory)
 
+
+
 ## Path Handling (Portable)
 
 Prefer explicit CLI paths for sharing scripts across machines.
@@ -463,12 +493,16 @@ $env:EK80_RAW_DIR = "D:\Cruise\EK80\Raw"
 python run_daily_batch.py --skip-existing
 ```
 
+
+
 ## HTML Resource Mode
 
 Both processing scripts support:
 
 - `--html-resources inline` (default) -> larger files, works offline
 - `--html-resources cdn` -> smaller files, needs internet access for Bokeh assets
+
+
 
 ## Memory and Performance Tips
 
@@ -487,6 +521,8 @@ Guidelines:
 - Tune on one day first, then scale to full date ranges.
 - Fine bins (`1m`, `1s`) increase processing load and output size.
 - Batch-by-day is safest for memory and fault isolation.
+
+
 
 ## Notes
 
