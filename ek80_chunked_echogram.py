@@ -1218,11 +1218,17 @@ def _compute_sv_with_bb_channel_fallback(
                 encode_mode="complex",
             )
         except Exception as channel_exc:  # noqa: BLE001 - channel-level fallback for changing tx params
-            if _is_changing_bb_transmit_param_error(channel_exc):
+            if _is_bb_complex_channel_fallback_error(channel_exc):
+                channel_fallback_reason = (
+                    "tau_effective merge conflicts"
+                    if _is_tau_effective_merge_error(channel_exc)
+                    else "changing BB transmit parameters"
+                )
                 LOGGER.warning(
-                    "Channel %s still has changing BB transmit parameters; "
+                    "Channel %s still has %s; "
                     "attempting segmented fallback for this channel.",
                     channel_name,
+                    channel_fallback_reason,
                 )
                 channel_ds_sv = _compute_sv_with_bb_tx_param_segmentation(channel_subset)
             else:
